@@ -1,9 +1,14 @@
 //! “最近记录”窗口。
 //!
 //! 用原生 Win32 ListView 展示数据库中最新的记录
-//! （时间 / 程序 / 路径 / 类型）。
+//! （监控时间 / 程序 / 路径 / 类型）。
 //! 使用原生控件而不是网页或 GPU 界面，空闲时几乎不占 CPU：
 //! 只有窗口处于激活状态时，才每 10 秒自动刷新一次列表。
+//!
+//! 交互：
+//! - 顶部搜索框按程序名 / 路径 / 类型实时过滤
+//! - 双击「创建程序」列打开程序所在目录，双击「路径」列打开文件所在目录
+//! - 在记录上点右键弹出菜单：打开文件路径 / 复制词条 / 打开创建程序所在目录
 
 use anyhow::Result;
 use once_cell::sync::Lazy;
@@ -12,21 +17,28 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ScreenToClient, UpdateWindow};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH,
-    LVCOLUMNW, LVHITTESTINFO, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_INSERTCOLUMNW,
-    LVM_INSERTITEMW, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST, LVN_ITEMACTIVATE, LVS_REPORT,
-    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR,
+    InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED,
+    LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST, LVN_ITEMACTIVATE, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NM_RCLICK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW,
-    KillTimer, LoadCursorW, MoveWindow, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    SetTimer, ShowWindow, TranslateMessage, CW_USEDEFAULT, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW,
-    MSG, SW_HIDE, SW_SHOWNORMAL, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CLOSE, WM_CREATE,
-    WM_NOTIFY, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CHILD,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetClientRect,
+    GetCursorPos, GetMessageW, GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MoveWindow,
+    PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer, ShowWindow,
+    TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL,
+    IDC_ARROW, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL, TPM_LEFTALIGN,
+    TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_NOTIFY, WM_NULL, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CHILD,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
@@ -56,14 +68,15 @@ const LIST_STYLE: windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE =
 
 static HISTORY_WINDOW: AtomicIsize = AtomicIsize::new(0);
 static LIST_VIEW: AtomicIsize = AtomicIsize::new(0);
+static SEARCH_EDIT: AtomicIsize = AtomicIsize::new(0);
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// 列表的列定义：（标题，宽度）。顺序必须和填充数据时使用的列下标一致。
 ///
-/// 双击时也用它按光标 x 坐标反推用户点的是哪一列，比依赖
+/// 双击 / 右键时也用它按光标 x 坐标反推用户点的是哪一列，比依赖
 /// `LVM_SUBITEMHITTEST` 返回的 iSubItem 更稳妥。
 const COLUMNS: [(&str, i32); 4] = [
-    ("创建时间", 170),
+    ("监控时间", 170),
     ("创建程序", 200),
     ("文件 / 文件夹路径", 520),
     ("类型", 100),
@@ -71,12 +84,34 @@ const COLUMNS: [(&str, i32); 4] = [
 
 /// 列表控件的子窗口 ID。处理 WM_NOTIFY 时要靠它确认通知来自列表。
 const LIST_CONTROL_ID: usize = 1;
+/// 搜索框的子窗口 ID。WM_COMMAND 里靠它区分搜索框的输入事件。
+const SEARCH_CONTROL_ID: usize = 2;
+
+/// 编辑框内容变化时向父窗口发送的通知码（commctrl 之外的 Windows 标准通知）。
+const EN_CHANGE_CODE: u32 = 0x0300;
+
+/// 右键菜单命令 ID。
+const MENU_OPEN_PATH: u32 = 4001;
+const MENU_COPY_ENTRY: u32 = 4002;
+const MENU_OPEN_PROGRAM_DIR: u32 = 4003;
+
+/// 剪贴板文本格式（CF_UNICODETEXT）。
+const CF_UNICODETEXT: u32 = 13;
+
+/// 在搜索框下方给列表留出的高度（像素）。
+const TOOLBAR_HEIGHT: i32 = 36;
 
 /// 当前列表里显示的行数据。
 ///
-/// ListView 只保存文本，双击时需要按行号找回完整记录（程序路径、文件路径），
+/// ListView 只保存文本，双击 / 右键时需要按行号找回完整记录（程序路径、文件路径），
 /// 所以刷新列表时同步缓存一份。
 static ROW_CACHE: Lazy<Mutex<Vec<FileOrigin>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// 从数据库读到的全部记录（未过滤）。切换搜索关键字时从这份数据里筛，不用重新查库。
+static ALL_ROWS: Lazy<Mutex<Vec<FileOrigin>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// 右键菜单当前针对的行号（-1 表示没有）。
+static CONTEXT_ROW: AtomicIsize = AtomicIsize::new(-1);
 
 /// 记录窗口使用的只读数据库连接（惰性打开，打开失败时列表为空）。
 static HISTORY_DB: Lazy<Mutex<Option<Database>>> = Lazy::new(|| Mutex::new(None));
@@ -157,7 +192,7 @@ unsafe extern "system" fn window_procedure(
     match message {
         WM_CREATE => {
             let module = GetModuleHandleW(None).unwrap_or_default();
-            create_list_view(hwnd, HINSTANCE(module.0));
+            create_controls(hwnd, HINSTANCE(module.0));
             // 窗口左上角与任务栏显示本程序自己的图标。
             let icon = crate::util::app_icon();
             SendMessageW(
@@ -174,31 +209,75 @@ unsafe extern "system" fn window_procedure(
             );
             LRESULT(0)
         }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as u32;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            match id {
+                // 搜索框内容变化：立刻按关键字重新过滤列表。
+                _ if id == SEARCH_CONTROL_ID as u32 && code == EN_CHANGE_CODE => {
+                    apply_filter();
+                }
+                MENU_OPEN_PATH => {
+                    if let Some(row) = context_row() {
+                        open_path_target(&row);
+                    }
+                }
+                MENU_COPY_ENTRY => {
+                    if let Some(row) = context_row() {
+                        copy_to_clipboard(&row.file_path);
+                    }
+                }
+                MENU_OPEN_PROGRAM_DIR => {
+                    if let Some(row) = context_row() {
+                        crate::util::reveal_in_explorer(&row.process_path);
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
         WM_NOTIFY => {
             let header = &*(lparam.0 as *const NMHDR);
-            if header.idFrom == LIST_CONTROL_ID && header.code == LVN_ITEMACTIVATE {
-                // 双击时用鼠标位置做命中测试拿到“行 + 列”。
-                // 这比依赖 NMLISTVIEW 里的 iSubItem 更可靠：
-                // 某些情况下该字段是 -1，会导致双击完全没反应。
+            if header.idFrom == LIST_CONTROL_ID {
                 let list = HWND(LIST_VIEW.load(Ordering::SeqCst) as *mut c_void);
-                if let Some((index, sub_item)) = hit_test_item(list) {
-                    // 记录一行日志，方便排查“双击没反应”这类问题：
-                    // 能看到用户实际点中的是第几行、第几列，以及那一行的目标。
-                    let cached = ROW_CACHE
-                        .lock()
-                        .ok()
-                        .and_then(|cache| cache.get(index).cloned());
-                    match cached {
-                        Some(row) => log::info!(
-                            "[记录] 双击第 {} 行第 {} 列：程序={} 路径={}",
-                            index + 1,
-                            sub_item,
-                            row.process_path,
-                            row.file_path
-                        ),
-                        None => log::warn!("[记录] 双击第 {} 行，但缓存里没有对应记录", index + 1),
+                match header.code {
+                    LVN_ITEMACTIVATE => {
+                        // 双击时用鼠标位置做命中测试拿到“行 + 列”。
+                        // 这比依赖 NMLISTVIEW 里的 iSubItem 更可靠：
+                        // 某些情况下该字段是 -1，会导致双击完全没反应。
+                        if let Some((index, sub_item)) = hit_test_item(list) {
+                            // 记录一行日志，方便排查“双击没反应”这类问题：
+                            // 能看到用户实际点中的是第几行、第几列，以及那一行的目标。
+                            let cached = ROW_CACHE
+                                .lock()
+                                .ok()
+                                .and_then(|cache| cache.get(index).cloned());
+                            match cached {
+                                Some(row) => log::info!(
+                                    "[记录] 双击第 {} 行第 {} 列：程序={} 路径={}",
+                                    index + 1,
+                                    sub_item,
+                                    row.process_path,
+                                    row.file_path
+                                ),
+                                None => {
+                                    log::warn!(
+                                        "[记录] 双击第 {} 行，但缓存里没有对应记录",
+                                        index + 1
+                                    )
+                                }
+                            }
+                            open_row_target(index, sub_item);
+                        }
                     }
-                    open_row_target(index, sub_item);
+                    NM_RCLICK => {
+                        // 右键点在记录上：选中该行并弹出操作菜单。
+                        if let Some((index, _)) = hit_test_item(list) {
+                            select_row(list, index);
+                            show_row_menu(hwnd, index);
+                        }
+                    }
+                    _ => {}
                 }
             }
             LRESULT(0)
@@ -206,7 +285,7 @@ unsafe extern "system" fn window_procedure(
         WM_SIZE => {
             let list = HWND(LIST_VIEW.load(Ordering::SeqCst) as *mut c_void);
             if !list.0.is_null() {
-                resize_list(hwnd, list);
+                resize_controls(hwnd, list);
             }
             LRESULT(0)
         }
@@ -236,14 +315,54 @@ unsafe extern "system" fn window_procedure(
     }
 }
 
-/// 创建列表控件，并设置三列。
-unsafe fn create_list_view(window: HWND, instance: HINSTANCE) {
+/// 创建窗口里的所有控件：搜索框 + 记录列表。
+unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     // 列表控件属于通用控件，必须先初始化。
     let controls = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
         dwICC: ICC_LISTVIEW_CLASSES,
     };
     let _ = InitCommonControlsEx(&controls);
+
+    // 搜索框左边的说明文字。
+    let label_class = wide("STATIC");
+    let label_text = wide("搜索：");
+    let _ = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(label_class.as_ptr()),
+        PCWSTR(label_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE,
+        8,
+        12,
+        48,
+        20,
+        window,
+        HMENU::default(),
+        instance,
+        None,
+    );
+
+    // 搜索框：用户输入时通过 WM_COMMAND(EN_CHANGE) 通知窗口，实时过滤列表。
+    let edit_class = wide("EDIT");
+    if let Ok(edit) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(edit_class.as_ptr()),
+        PCWSTR::null(),
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_BORDER
+            | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+        56,
+        8,
+        300,
+        24,
+        window,
+        HMENU(SEARCH_CONTROL_ID as *mut std::ffi::c_void),
+        instance,
+        None,
+    ) {
+        SEARCH_EDIT.store(edit.0 as isize, Ordering::SeqCst);
+    }
 
     let list_class = wide("SysListView32");
     let list = match CreateWindowExW(
@@ -252,7 +371,7 @@ unsafe fn create_list_view(window: HWND, instance: HINSTANCE) {
         PCWSTR::null(),
         LIST_STYLE,
         0,
-        0,
+        TOOLBAR_HEIGHT,
         100,
         100,
         window,
@@ -282,18 +401,29 @@ unsafe fn create_list_view(window: HWND, instance: HINSTANCE) {
         );
     }
 
-    resize_list(window, list);
+    resize_controls(window, list);
 }
 
-/// 让列表跟随窗口大小变化。
-unsafe fn resize_list(window: HWND, list: HWND) {
+/// 让搜索框和列表跟随窗口大小变化。
+unsafe fn resize_controls(window: HWND, list: HWND) {
     let mut rect = RECT::default();
     if GetClientRect(window, &mut rect).is_err() {
         return;
     }
-    let width = (rect.right - rect.left - 16).max(100);
-    let height = (rect.bottom - rect.top - 16).max(100);
-    let _ = MoveWindow(list, 8, 8, width, height, true);
+    let client_width = rect.right - rect.left;
+    let client_height = rect.bottom - rect.top;
+
+    // 搜索框宽度跟着窗口走，右边留 8 像素边距。
+    let edit = HWND(SEARCH_EDIT.load(Ordering::SeqCst) as *mut c_void);
+    if !edit.0.is_null() {
+        let edit_width = (client_width - 56 - 8).max(120);
+        let _ = MoveWindow(edit, 56, 8, edit_width, 24, true);
+    }
+
+    // 列表放在搜索栏下方。
+    let list_width = (client_width - 16).max(100);
+    let list_height = (client_height - TOOLBAR_HEIGHT - 8).max(100);
+    let _ = MoveWindow(list, 8, TOOLBAR_HEIGHT, list_width, list_height, true);
 }
 
 /// 从数据库读取最近记录（失败时返回空列表）。
@@ -312,14 +442,7 @@ fn load_rows() -> Vec<FileOrigin> {
     }
 
     match guard.as_ref() {
-        Some(db) => {
-            let rows = db.recent(MAX_ROWS).unwrap_or_default();
-            // 同步缓存，供双击时按行号取回完整记录。
-            if let Ok(mut cache) = ROW_CACHE.lock() {
-                *cache = rows.clone();
-            }
-            rows
-        }
+        Some(db) => db.recent(MAX_ROWS).unwrap_or_default(),
         None => Vec::new(),
     }
 }
@@ -379,36 +502,97 @@ fn column_at_x(x: i32) -> i32 {
 /// - 双击「文件 / 文件夹路径」列：打开文件所在目录并选中它；
 ///   如果记录本身就是文件夹，则直接打开这个文件夹
 fn open_row_target(index: usize, sub_item: i32) {
-    let row = match ROW_CACHE.lock() {
-        Ok(cache) => cache.get(index).cloned(),
-        Err(poisoned) => poisoned.into_inner().get(index).cloned(),
-    };
+    let row = cached_row(index);
     let Some(row) = row else {
         return;
     };
 
     match sub_item {
         1 => crate::util::reveal_in_explorer(&row.process_path),
-        2 => {
-            if std::path::Path::new(&row.file_path).is_dir() {
-                crate::util::open_directory(&row.file_path);
-            } else {
-                crate::util::reveal_in_explorer(&row.file_path);
-            }
-        }
+        2 => open_path_target(&row),
         // 时间列不做操作。
         _ => {}
     }
 }
 
-/// 清空并重新填充列表。
+/// 按行号从缓存里取回完整记录（双击 / 右键共用）。
+fn cached_row(index: usize) -> Option<FileOrigin> {
+    match ROW_CACHE.lock() {
+        Ok(cache) => cache.get(index).cloned(),
+        Err(poisoned) => poisoned.into_inner().get(index).cloned(),
+    }
+}
+
+/// 打开记录里的文件 / 文件夹所在位置。
+///
+/// - 普通文件：打开所在目录并选中它
+/// - 文件夹：直接打开这个文件夹
+fn open_path_target(row: &FileOrigin) {
+    if std::path::Path::new(&row.file_path).is_dir() {
+        crate::util::open_directory(&row.file_path);
+    } else {
+        crate::util::reveal_in_explorer(&row.file_path);
+    }
+}
+
+/// 从数据库重新读取记录，再按当前搜索关键字刷新列表。
 fn refresh_list() {
+    let rows = load_rows();
+    if let Ok(mut cache) = ALL_ROWS.lock() {
+        *cache = rows;
+    }
+    apply_filter();
+}
+
+/// 按搜索框里的关键字过滤记录，并重新填充列表。
+fn apply_filter() {
+    let keyword = search_text().to_lowercase();
+    let rows = ALL_ROWS
+        .lock()
+        .map(|cache| cache.clone())
+        .unwrap_or_default();
+
+    let filtered: Vec<FileOrigin> = if keyword.is_empty() {
+        rows
+    } else {
+        rows.into_iter()
+            .filter(|row| matches_keyword(row, &keyword))
+            .collect()
+    };
+
+    fill_list(&filtered);
+}
+
+/// 判断一条记录是否匹配搜索关键字（程序名 / 路径 / 类型，忽略大小写）。
+fn matches_keyword(row: &FileOrigin, keyword: &str) -> bool {
+    row.process_name.to_lowercase().contains(keyword)
+        || row.file_path.to_lowercase().contains(keyword)
+        || row.process_path.to_lowercase().contains(keyword)
+        || action_label(&row.action).to_lowercase().contains(keyword)
+}
+
+/// 读取搜索框里当前的文字。
+fn search_text() -> String {
+    let edit = HWND(SEARCH_EDIT.load(Ordering::SeqCst) as *mut c_void);
+    if edit.0.is_null() {
+        return String::new();
+    }
+    let mut buffer = vec![0u16; 512];
+    let length = unsafe { GetWindowTextW(edit, &mut buffer) }.max(0) as usize;
+    let length = length.min(buffer.len());
+    String::from_utf16_lossy(&buffer[..length])
+}
+
+/// 把给定记录填入列表，并同步行缓存（双击 / 右键要靠它按行号找回记录）。
+fn fill_list(rows: &[FileOrigin]) {
     let list = HWND(LIST_VIEW.load(Ordering::SeqCst) as *mut c_void);
     if list.0.is_null() {
         return;
     }
 
-    let rows = load_rows();
+    if let Ok(mut cache) = ROW_CACHE.lock() {
+        *cache = rows.to_vec();
+    }
 
     unsafe {
         SendMessageW(list, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
@@ -444,6 +628,107 @@ fn refresh_list() {
             let action_text = wide(&action_label(&row.action));
             insert_sub_item(list, row_index, 3, &action_text);
         }
+    }
+}
+
+/// 选中某一行，让用户看清右键菜单针对的是哪条记录。
+unsafe fn select_row(list: HWND, index: usize) {
+    let mut item = LVITEMW::default();
+    item.mask = LVIF_STATE;
+    item.stateMask = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
+    item.state = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
+    SendMessageW(
+        list,
+        LVM_SETITEMSTATE,
+        WPARAM(index),
+        LPARAM(&item as *const _ as isize),
+    );
+}
+
+/// 在右键位置弹出记录操作菜单。
+unsafe fn show_row_menu(window: HWND, index: usize) {
+    CONTEXT_ROW.store(index as isize, Ordering::SeqCst);
+
+    let Ok(menu) = CreatePopupMenu() else {
+        return;
+    };
+
+    let items: [(u32, &str); 3] = [
+        (MENU_OPEN_PATH, "打开文件路径"),
+        (MENU_COPY_ENTRY, "复制词条"),
+        (MENU_OPEN_PROGRAM_DIR, "打开创建程序所在目录"),
+    ];
+
+    for (position, (command, text)) in items.iter().enumerate() {
+        let text = wide(text);
+        let _ = InsertMenuW(
+            menu,
+            position as u32,
+            MF_BYPOSITION | MF_STRING,
+            *command as usize,
+            PCWSTR(text.as_ptr()),
+        );
+    }
+    // 前两项是“对这条记录本身的操作”，第三项针对创建者程序，用分隔线隔开。
+    let _ = InsertMenuW(menu, 2, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
+
+    let mut point = POINT::default();
+    if GetCursorPos(&mut point).is_err() {
+        let _ = DestroyMenu(menu);
+        return;
+    }
+
+    // TrackPopupMenu 要求窗口在前台，否则点菜单外面菜单不会消失。
+    let _ = SetForegroundWindow(window);
+    let _ = TrackPopupMenu(
+        menu,
+        TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+        point.x,
+        point.y,
+        0,
+        window,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+    // 让菜单正常关闭（Windows 官方示例里的做法）。
+    let _ = PostMessageW(window, WM_NULL, WPARAM(0), LPARAM(0));
+}
+
+/// 右键菜单当前针对的记录。
+fn context_row() -> Option<FileOrigin> {
+    let index = CONTEXT_ROW.load(Ordering::SeqCst);
+    if index < 0 {
+        return None;
+    }
+    cached_row(index as usize)
+}
+
+/// 把文本复制到剪贴板（Unicode 文本）。
+fn copy_to_clipboard(text: &str) {
+    let utf16 = wide(text);
+    let bytes = utf16.len() * 2;
+
+    unsafe {
+        if OpenClipboard(HWND::default()).is_err() {
+            return;
+        }
+        let _ = EmptyClipboard();
+
+        // 剪贴板要求用“可移动的全局内存”存放数据，系统随后接管这块内存的所有权。
+        if let Ok(handle) = GlobalAlloc(GMEM_MOVEABLE, bytes) {
+            let pointer = GlobalLock(handle);
+            if !pointer.is_null() {
+                std::ptr::copy_nonoverlapping(
+                    utf16.as_ptr() as *const u8,
+                    pointer as *mut u8,
+                    bytes,
+                );
+                let _ = GlobalUnlock(handle);
+            }
+            let _ = SetClipboardData(CF_UNICODETEXT, HANDLE(handle.0));
+        }
+
+        let _ = CloseClipboard();
     }
 }
 

@@ -42,6 +42,9 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "Win32_System_SystemServices",
+    # 复制词条到剪贴板需要数据交换（剪贴板）与全局内存分配
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_Graphics_Gdi",
     # 允许用 #[implement] 实现 COM 接口（右键菜单扩展）
     "implement",
