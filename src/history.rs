@@ -17,8 +17,10 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{ScreenToClient, UpdateWindow};
+use windows::Win32::Foundation::{
+    COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{ScreenToClient, SetBkColor, SetTextColor, UpdateWindow};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
@@ -28,7 +30,8 @@ use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
     LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED,
     LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST, LVN_ITEMACTIVATE, LVS_REPORT,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST,
+    LVN_ITEMACTIVATE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_REPORT,
     LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NM_RCLICK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -38,8 +41,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL,
     IDC_ARROW, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL, TPM_LEFTALIGN,
     TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_NOTIFY, WM_NULL, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_NOTIFY, WM_NULL, WM_SETFONT, WM_SETICON,
+    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::db::{Database, FileOrigin};
@@ -77,8 +80,8 @@ static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// `LVM_SUBITEMHITTEST` 返回的 iSubItem 更稳妥。
 const COLUMNS: [(&str, i32); 4] = [
     ("监控时间", 170),
-    ("创建程序", 200),
-    ("文件 / 文件夹路径", 520),
+    ("创建程序", 280),
+    ("文件 / 文件夹路径", 440),
     ("类型", 100),
 ];
 
@@ -94,6 +97,7 @@ const EN_CHANGE_CODE: u32 = 0x0300;
 const MENU_OPEN_PATH: u32 = 4001;
 const MENU_COPY_ENTRY: u32 = 4002;
 const MENU_OPEN_PROGRAM_DIR: u32 = 4003;
+const MENU_SET_NOTE: u32 = 4004;
 
 /// 剪贴板文本格式（CF_UNICODETEXT）。
 const CF_UNICODETEXT: u32 = 13;
@@ -173,6 +177,8 @@ fn register_class(instance: HINSTANCE) -> Result<()> {
     window_class.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
     window_class.lpfnWndProc = Some(window_procedure);
     window_class.hInstance = instance;
+    // 窗口背景统一用白色画刷，配合控件字体让界面更干净。
+    window_class.hbrBackground = crate::util::ui_brush();
     window_class.hCursor = unsafe { LoadCursorW(HINSTANCE::default(), IDC_ARROW)? };
     window_class.lpszClassName = PCWSTR(class_name.as_ptr());
 
@@ -232,6 +238,11 @@ unsafe extern "system" fn window_procedure(
                         crate::util::reveal_in_explorer(&row.process_path);
                     }
                 }
+                MENU_SET_NOTE => {
+                    if let Some(row) = context_row() {
+                        edit_program_note(&row);
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -282,6 +293,14 @@ unsafe extern "system" fn window_procedure(
             }
             LRESULT(0)
         }
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
+            // 让「搜索」标签和搜索框背景与窗口一致（白色），
+            // 否则系统会画出默认的灰色背景，和白色窗口拼在一起很突兀。
+            let device = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
+            SetBkColor(device, COLORREF(0x00FF_FFFF));
+            SetTextColor(device, COLORREF(0x0020_2020));
+            LRESULT(crate::util::ui_brush().0 as isize)
+        }
         WM_SIZE => {
             let list = HWND(LIST_VIEW.load(Ordering::SeqCst) as *mut c_void);
             if !list.0.is_null() {
@@ -325,32 +344,35 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     let _ = InitCommonControlsEx(&controls);
 
     // 搜索框左边的说明文字。
+    let font = crate::util::ui_font();
     let label_class = wide("STATIC");
-    let label_text = wide("搜索：");
-    let _ = CreateWindowExW(
+    let label_text = wide("搜索");
+    let label = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         PCWSTR(label_class.as_ptr()),
         PCWSTR(label_text.as_ptr()),
         WS_CHILD | WS_VISIBLE,
-        8,
         12,
-        48,
+        13,
+        40,
         20,
         window,
         HMENU::default(),
         instance,
         None,
     );
+    if let Ok(label) = label {
+        SendMessageW(label, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
 
     // 搜索框：用户输入时通过 WM_COMMAND(EN_CHANGE) 通知窗口，实时过滤列表。
     let edit_class = wide("EDIT");
     if let Ok(edit) = CreateWindowExW(
-        WINDOW_EX_STYLE::default(),
+        WINDOW_EX_STYLE(0x0000_0200), // WS_EX_CLIENTEDGE：输入框加立体边框
         PCWSTR(edit_class.as_ptr()),
         PCWSTR::null(),
         WS_CHILD
             | WS_VISIBLE
-            | WS_BORDER
             | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(ES_AUTOHSCROLL as u32),
         56,
         8,
@@ -362,11 +384,12 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         None,
     ) {
         SEARCH_EDIT.store(edit.0 as isize, Ordering::SeqCst);
+        SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
     }
 
     let list_class = wide("SysListView32");
     let list = match CreateWindowExW(
-        WINDOW_EX_STYLE::default(),
+        WINDOW_EX_STYLE(0x0000_0200), // WS_EX_CLIENTEDGE：列表加立体边框
         PCWSTR(list_class.as_ptr()),
         PCWSTR::null(),
         LIST_STYLE,
@@ -384,6 +407,16 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     };
 
     LIST_VIEW.store(list.0 as isize, Ordering::SeqCst);
+    SendMessageW(list, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+
+    // 扩展样式：整行选中、网格线、双缓冲（滚动时不闪）。
+    let extended = LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER;
+    SendMessageW(
+        list,
+        LVM_SETEXTENDEDLISTVIEWSTYLE,
+        WPARAM(extended as usize),
+        LPARAM(extended as isize),
+    );
 
     let columns = COLUMNS;
 
@@ -563,11 +596,12 @@ fn apply_filter() {
     fill_list(&filtered);
 }
 
-/// 判断一条记录是否匹配搜索关键字（程序名 / 路径 / 类型，忽略大小写）。
+/// 判断一条记录是否匹配搜索关键字（程序名 / 路径 / 类型 / 备注，忽略大小写）。
 fn matches_keyword(row: &FileOrigin, keyword: &str) -> bool {
     row.process_name.to_lowercase().contains(keyword)
         || row.file_path.to_lowercase().contains(keyword)
         || row.process_path.to_lowercase().contains(keyword)
+        || row.note.to_lowercase().contains(keyword)
         || action_label(&row.action).to_lowercase().contains(keyword)
 }
 
@@ -618,7 +652,7 @@ fn fill_list(rows: &[FileOrigin]) {
             }
             let row_index = inserted.0 as usize;
 
-            let program_text = wide(&row.process_name);
+            let program_text = wide(&program_column_text(row));
             insert_sub_item(list, row_index, 1, &program_text);
 
             let path_text = wide(&row.file_path);
@@ -653,10 +687,11 @@ unsafe fn show_row_menu(window: HWND, index: usize) {
         return;
     };
 
-    let items: [(u32, &str); 3] = [
+    let items: [(u32, &str); 4] = [
         (MENU_OPEN_PATH, "打开文件路径"),
         (MENU_COPY_ENTRY, "复制词条"),
         (MENU_OPEN_PROGRAM_DIR, "打开创建程序所在目录"),
+        (MENU_SET_NOTE, "设置程序备注…"),
     ];
 
     for (position, (command, text)) in items.iter().enumerate() {
@@ -669,7 +704,7 @@ unsafe fn show_row_menu(window: HWND, index: usize) {
             PCWSTR(text.as_ptr()),
         );
     }
-    // 前两项是“对这条记录本身的操作”，第三项针对创建者程序，用分隔线隔开。
+    // 前两项是“对这条记录本身的操作”，后两项针对创建者程序，用分隔线隔开。
     let _ = InsertMenuW(menu, 2, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
 
     let mut point = POINT::default();
@@ -703,6 +738,43 @@ fn context_row() -> Option<FileOrigin> {
     cached_row(index as usize)
 }
 
+/// 打开备注编辑窗口，并把用户输入的备注保存到数据库。
+///
+/// 备注按「程序完整路径」保存：同一个程序以后产生的每条记录都会带上它；
+/// 输入空内容表示删除这条备注。
+fn edit_program_note(row: &FileOrigin) {
+    let owner = HWND(HISTORY_WINDOW.load(Ordering::SeqCst) as *mut c_void);
+
+    // 弹出模态窗口；用户点“取消”时返回 None，直接结束。
+    let Some(note) = crate::note::show(owner, &row.process_name, &row.process_path, &row.note)
+    else {
+        return;
+    };
+
+    // 记录窗口用的是只读连接，写备注必须另开一个可写连接。
+    let result = crate::config::Config::default_data_dir()
+        .map_err(|error| anyhow::anyhow!("{:#}", error))
+        .and_then(|data_dir| Database::init(&data_dir))
+        .and_then(|db| db.set_program_note(&row.process_path, &note));
+
+    match result {
+        Ok(()) => {
+            log::info!(
+                "[记录] 程序备注已保存：{} -> {}",
+                row.process_path,
+                if note.is_empty() {
+                    "（已清除）"
+                } else {
+                    note.as_str()
+                }
+            );
+            // 立刻刷新列表：同一个程序的其它记录也要马上显示新备注。
+            refresh_list();
+        }
+        Err(error) => log::error!("[记录] 保存程序备注失败：{:#}", error),
+    }
+}
+
 /// 把文本复制到剪贴板（Unicode 文本）。
 fn copy_to_clipboard(text: &str) {
     let utf16 = wide(text);
@@ -729,6 +801,28 @@ fn copy_to_clipboard(text: &str) {
         }
 
         let _ = CloseClipboard();
+    }
+}
+
+/// 「创建程序」列显示的文字。
+///
+/// 有备注时把备注接在程序名后面，例如 `notepad.exe（我自己启动的记事本）`，
+/// 这样用户扫一眼就知道这个程序是干什么的。备注太长时截断，
+/// 避免一条记录把整列撑开（完整内容可以通过搜索框查）。
+fn program_column_text(row: &FileOrigin) -> String {
+    /// 列表里最多显示多少个备注字符。
+    const MAX_NOTE_CHARS: usize = 24;
+
+    let note = row.note.trim();
+    if note.is_empty() {
+        return row.process_name.clone();
+    }
+
+    if note.chars().count() > MAX_NOTE_CHARS {
+        let short: String = note.chars().take(MAX_NOTE_CHARS).collect();
+        format!("{}（{}…）", row.process_name, short)
+    } else {
+        format!("{}（{}）", row.process_name, note)
     }
 }
 
@@ -783,8 +877,8 @@ mod tests {
         assert_eq!(column_at_x(0), 0);
         assert_eq!(column_at_x(169), 0);
         assert_eq!(column_at_x(170), 1);
-        assert_eq!(column_at_x(369), 1);
-        assert_eq!(column_at_x(370), 2);
+        assert_eq!(column_at_x(449), 1);
+        assert_eq!(column_at_x(450), 2);
         assert_eq!(column_at_x(889), 2);
         assert_eq!(column_at_x(890), 3);
         assert_eq!(column_at_x(5000), 3);

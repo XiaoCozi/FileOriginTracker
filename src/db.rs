@@ -7,7 +7,7 @@
 //! - file_origins : 存储文件路径 -> 创建进程 的映射
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -31,6 +31,11 @@ pub struct FileOrigin {
     /// 事件类型："create_file"（新建文件）、"create_dir"（新建文件夹）、
     /// "modify"（文件被修改）。列表里用来显示类型列。
     pub action: String,
+    /// 用户给这个程序起的备注（没有备注时为空字符串）。
+    ///
+    /// 备注按“程序完整路径”保存，所以同一个程序名的不同版本可以分别备注，
+    /// 之后这个程序产生的每条记录都会带上它。
+    pub note: String,
 }
 
 impl Database {
@@ -78,6 +83,14 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_modified_at
                 ON file_modifications(modified_at);
+
+            -- 程序备注：给某个程序（按完整路径区分）加一句说明，
+            -- 之后该程序的所有监控记录都会显示这句备注。
+            CREATE TABLE IF NOT EXISTS program_notes (
+                process_path TEXT PRIMARY KEY,
+                note         TEXT NOT NULL,
+                updated_at   INTEGER NOT NULL
+            );
             "#,
         )?;
 
@@ -185,8 +198,11 @@ impl Database {
         let conn = self.lock_connection();
 
         let mut stmt = conn.prepare(
-            "SELECT file_path, process_name, process_path, created_at, is_directory
-             FROM file_origins WHERE file_path = ?1",
+            "SELECT o.file_path, o.process_name, o.process_path, o.created_at, o.is_directory,
+                    COALESCE(n.note, '')
+             FROM file_origins o
+             LEFT JOIN program_notes n ON n.process_path = o.process_path
+             WHERE o.file_path = ?1",
         )?;
 
         let result = stmt.query_row(params![file_path], |row| {
@@ -201,6 +217,7 @@ impl Database {
                 } else {
                     "create_file".to_string()
                 },
+                note: row.get(5)?,
             })
         });
 
@@ -229,7 +246,9 @@ impl Database {
         // 只会在列表里显示成一堆只有时间、内容空白的行。
         let mut stmt = conn.prepare(
             r#"
-            SELECT file_path, process_name, process_path, created_at, action FROM (
+            SELECT t.file_path, t.process_name, t.process_path, t.created_at, t.action,
+                   COALESCE(n.note, '')
+            FROM (
                 SELECT file_path, process_name, process_path, created_at,
                        CASE WHEN is_directory <> 0 THEN 'create_dir' ELSE 'create_file' END AS action
                 FROM file_origins
@@ -237,9 +256,10 @@ impl Database {
                 SELECT file_path, process_name, process_path, modified_at AS created_at,
                        'modify' AS action
                 FROM file_modifications
-            )
-            WHERE file_path <> '' AND process_name <> '' AND process_path <> ''
-            ORDER BY created_at DESC
+            ) AS t
+            LEFT JOIN program_notes n ON n.process_path = t.process_path
+            WHERE t.file_path <> '' AND t.process_name <> '' AND t.process_path <> ''
+            ORDER BY t.created_at DESC
             LIMIT ?1
             "#,
         )?;
@@ -251,6 +271,7 @@ impl Database {
                 process_path: row.get(2)?,
                 created_at: row.get(3)?,
                 action: row.get(4)?,
+                note: row.get(5)?,
             })
         })?;
 
@@ -296,6 +317,44 @@ impl Database {
         }
 
         Ok(deleted)
+    }
+
+    /// 保存（或更新）某个程序的备注。
+    ///
+    /// 备注按程序完整路径保存；传入空字符串表示删除这条备注。
+    /// 之所以用完整路径而不是文件名，是因为不同目录下可能有同名程序。
+    pub fn set_program_note(&self, process_path: &str, note: &str) -> Result<()> {
+        let conn = self.lock_connection();
+        let note = note.trim();
+
+        if note.is_empty() {
+            conn.execute(
+                "DELETE FROM program_notes WHERE process_path = ?1",
+                params![process_path],
+            )?;
+            return Ok(());
+        }
+
+        conn.execute(
+            "INSERT INTO program_notes(process_path, note, updated_at)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(process_path) DO UPDATE SET
+                 note = excluded.note,
+                 updated_at = excluded.updated_at",
+            params![process_path, note, chrono_now()],
+        )?;
+        Ok(())
+    }
+
+    /// 读取某个程序当前的备注（没有时返回空字符串）。
+    pub fn program_note(&self, process_path: &str) -> Result<String> {
+        let conn = self.lock_connection();
+        let mut stmt = conn.prepare("SELECT note FROM program_notes WHERE process_path = ?1")?;
+        let note = stmt
+            .query_row(params![process_path], |row| row.get::<_, String>(0))
+            .optional()?
+            .unwrap_or_default();
+        Ok(note)
     }
 }
 
@@ -344,6 +403,52 @@ mod tests {
         let deleted = db.maintain(7).unwrap();
         assert_eq!(deleted, 50);
         assert_eq!(db.count().unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 验证「程序备注」：设置后备注会跟着这个程序的所有记录一起返回，
+    /// 清空备注后记录里不再带备注。
+    #[test]
+    fn program_note_follows_records() {
+        let dir = std::env::temp_dir().join("file_origin_tracker_note_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Database::init(&dir).unwrap();
+
+        db.upsert_origin(
+            r"C:\note\a.txt",
+            "notepad.exe",
+            r"C:\Windows\notepad.exe",
+            false,
+        )
+        .unwrap();
+
+        // 一开始没有备注。
+        let rows = db.recent(10).unwrap();
+        assert_eq!(rows[0].note, "");
+
+        // 设置备注后，查询结果里带上备注。
+        db.set_program_note(r"C:\Windows\notepad.exe", "我自己启动的记事本")
+            .unwrap();
+        let rows = db.recent(10).unwrap();
+        assert_eq!(rows[0].note, "我自己启动的记事本");
+        assert_eq!(
+            db.get_origin(r"C:\note\a.txt").unwrap().unwrap().note,
+            "我自己启动的记事本"
+        );
+
+        // 「最近记录」窗口用的是只读连接：另开一个连接写入备注后，
+        // 只读连接再次查询也应该立刻看到新备注（WAL 模式下已提交的数据对读者可见）。
+        let reader = Database::open_readonly(&dir).unwrap();
+        db.set_program_note(r"C:\Windows\notepad.exe", "只读连接也要看到")
+            .unwrap();
+        assert_eq!(reader.recent(10).unwrap()[0].note, "只读连接也要看到");
+
+        // 空字符串表示删除备注。
+        db.set_program_note(r"C:\Windows\notepad.exe", "").unwrap();
+        let rows = db.recent(10).unwrap();
+        assert_eq!(rows[0].note, "");
+        assert_eq!(db.program_note(r"C:\Windows\notepad.exe").unwrap(), "");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

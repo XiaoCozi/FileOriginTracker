@@ -14,8 +14,10 @@ use anyhow::Result;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
+use windows::Win32::Foundation::{
+    GetLastError, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
@@ -24,10 +26,11 @@ use windows::Win32::System::Registry::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetWindowTextW, LoadCursorW, MessageBoxW, RegisterClassExW,
     SendMessageW, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
-    BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_NUMBER, HMENU, ICON_BIG, ICON_SMALL,
-    IDC_ARROW, MB_ICONWARNING, MB_OK, SW_HIDE, SW_SHOWNORMAL, WA_INACTIVE, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_SETICON, WNDCLASSEXW, WS_BORDER,
-    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    BS_GROUPBOX, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_NUMBER, HMENU, ICON_BIG,
+    ICON_SMALL, IDC_ARROW, MB_ICONWARNING, MB_OK, SW_HIDE, SW_SHOWNORMAL, WA_INACTIVE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
+    WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_SETICON, WNDCLASSEXW, WS_CHILD, WS_EX_CLIENTEDGE,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::config::Config;
@@ -86,8 +89,8 @@ pub fn show() -> Result<()> {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            520,
-            470,
+            560,
+            528,
             HWND::default(),
             HMENU::default(),
             instance,
@@ -113,6 +116,8 @@ fn register_class(instance: HINSTANCE) -> Result<()> {
     window_class.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
     window_class.lpfnWndProc = Some(window_procedure);
     window_class.hInstance = instance;
+    // 白色背景 + 统一字体，与「最近记录」窗口保持一致的观感。
+    window_class.hbrBackground = crate::util::ui_brush();
     window_class.hCursor = unsafe { LoadCursorW(HINSTANCE::default(), IDC_ARROW)? };
     window_class.lpszClassName = PCWSTR(class_name.as_ptr());
 
@@ -158,6 +163,14 @@ unsafe extern "system" fn window_procedure(
                 _ => DefWindowProcW(hwnd, message, wparam, lparam),
             }
         }
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
+            // 白色背景 + 深灰文字：分组框、标签、输入框和窗口融为一体，
+            // 不会出现系统默认的灰色块。
+            let device = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut std::ffi::c_void);
+            SetBkColor(device, COLORREF(0x00FF_FFFF));
+            SetTextColor(device, COLORREF(0x0020_2020));
+            LRESULT(crate::util::ui_brush().0 as isize)
+        }
         WM_ACTIVATE => {
             if (wparam.0 & 0xFFFF) as u32 != WA_INACTIVE {
                 load_values(hwnd);
@@ -173,8 +186,13 @@ unsafe extern "system" fn window_procedure(
 }
 
 /// 创建窗口里的所有控件。
+///
+/// 布局思路：用四个分组框把设置项按用途分开
+/// （记录保存 / 启动 / 文件监控 / 资源管理器右键菜单），
+/// 底部右侧放「保存」「关闭」。用户从上往下扫一遍就知道每项是干什么的，
+/// 不会像原来那样一堆文字挤在一起分不清重点。
 unsafe fn create_controls(window: HWND) {
-    let font = GetStockObject(DEFAULT_GUI_FONT);
+    let font = crate::util::ui_font();
     let icon = crate::util::app_icon();
     SendMessageW(
         window,
@@ -189,200 +207,278 @@ unsafe fn create_controls(window: HWND) {
         LPARAM(icon.0 as isize),
     );
 
-    let label = create_control(
-        "STATIC",
-        "记录保留天数（1 ~ 3650）：",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
-        20,
-        24,
-        200,
-        24,
-        window,
-        0,
+    // 三类控件共用的样式，避免每处都重复写一长串。
+    let label_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0);
+    let check_style =
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32);
+    let button_style =
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32);
+    let edit_style = WINDOW_STYLE(
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | ES_NUMBER as u32 | ES_AUTOHSCROLL as u32,
     );
-    set_font(label, font);
 
-    let edit = create_control(
-        "EDIT",
-        "",
-        WINDOW_STYLE(
-            WS_CHILD.0
-                | WS_VISIBLE.0
-                | WS_BORDER.0
-                | WS_TABSTOP.0
-                | ES_NUMBER as u32
-                | ES_AUTOHSCROLL as u32,
+    // ---- 分组 1：记录保存 ----
+    create_group(window, "记录保存", 16, 12, 512, 84, font);
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "STATIC",
+            "记录保留天数（1 ~ 3650）：",
+            label_style,
+            34,
+            38,
+            190,
+            22,
+            window,
+            0,
         ),
-        230,
-        20,
-        90,
-        26,
-        window,
-        ID_RETENTION_EDIT,
+        font,
     );
-    set_font(edit, font);
-
-    let hint = create_control(
-        "STATIC",
-        "超过天数的旧记录会被自动删除，并压缩数据库文件释放空间。",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
-        20,
-        56,
-        440,
-        22,
-        window,
-        0,
+    set_font(
+        create_control(
+            WS_EX_CLIENTEDGE, // 输入框加立体边框，比 WS_BORDER 更清晰
+            "EDIT",
+            "",
+            edit_style,
+            232,
+            34,
+            90,
+            26,
+            window,
+            ID_RETENTION_EDIT,
+        ),
+        font,
     );
-    set_font(hint, font);
-
-    let autostart = create_control(
-        "BUTTON",
-        "开机自动启动（登录后自动在后台记录）",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
-        20,
-        92,
-        400,
-        26,
-        window,
-        ID_AUTOSTART_CHECK,
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "STATIC",
+            "天",
+            label_style,
+            332,
+            38,
+            30,
+            22,
+            window,
+            0,
+        ),
+        font,
     );
-    set_font(autostart, font);
-
-    // ---- 监控开关：拆成三个独立选项 ----
-    let monitor_title = create_control(
-        "STATIC",
-        "文件监控（可分别开关，全部关闭时停止监控）：",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
-        20,
-        128,
-        440,
-        22,
-        window,
-        0,
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "STATIC",
+            "超过天数的旧记录会被自动删除，并压缩数据库释放空间。",
+            label_style,
+            34,
+            64,
+            470,
+            20,
+            window,
+            0,
+        ),
+        font,
     );
-    set_font(monitor_title, font);
 
-    let monitor_file = create_control(
-        "BUTTON",
-        "创建文件监控（记录新建的文件）",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
-        40,
+    // ---- 分组 2：启动 ----
+    create_group(window, "启动", 16, 104, 512, 62, font);
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "开机自动启动（登录后自动在后台记录）",
+            check_style,
+            34,
+            128,
+            460,
+            24,
+            window,
+            ID_AUTOSTART_CHECK,
+        ),
+        font,
+    );
+
+    // ---- 分组 3：文件监控 ----
+    create_group(
+        window,
+        "文件监控（可分别开关，全部关闭时停止监控）",
+        16,
+        174,
+        512,
         154,
-        420,
-        26,
-        window,
-        ID_MONITOR_FILE_CHECK,
+        font,
     );
-    set_font(monitor_file, font);
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "创建文件监控（记录新建的文件）",
+            check_style,
+            34,
+            196,
+            460,
+            24,
+            window,
+            ID_MONITOR_FILE_CHECK,
+        ),
+        font,
+    );
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "创建文件夹监控（记录新建的文件夹）",
+            check_style,
+            34,
+            222,
+            460,
+            24,
+            window,
+            ID_MONITOR_DIR_CHECK,
+        ),
+        font,
+    );
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "修改文件监控（记录文件内容被修改，默认关闭）",
+            check_style,
+            34,
+            248,
+            460,
+            24,
+            window,
+            ID_MONITOR_MODIFY_CHECK,
+        ),
+        font,
+    );
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "STATIC",
+            "三个开关都关闭后立即停止监控，不再记录任何文件事件，也不占用 CPU；\n修改监控写入较频繁，默认不开启。",
+            label_style,
+            34,
+            276,
+            470,
+            40,
+            window,
+            0,
+        ),
+        font,
+    );
 
-    let monitor_dir = create_control(
+    // ---- 分组 4：资源管理器右键菜单 ----
+    create_group(window, "资源管理器右键菜单", 16, 336, 512, 88, font);
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "STATIC",
+            "注册后可以在文件 / 文件夹上右键，查看它的创建来源。",
+            label_style,
+            34,
+            356,
+            470,
+            20,
+            window,
+            0,
+        ),
+        font,
+    );
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "注册右键菜单",
+            button_style,
+            34,
+            382,
+            120,
+            30,
+            window,
+            ID_REGISTER_SHELL_BUTTON,
+        ),
+        font,
+    );
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "注销右键菜单",
+            button_style,
+            170,
+            382,
+            120,
+            30,
+            window,
+            ID_UNREGISTER_SHELL_BUTTON,
+        ),
+        font,
+    );
+
+    // ---- 底部按钮：靠右排列，符合 Windows 习惯 ----
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "保存",
+            button_style,
+            316,
+            440,
+            100,
+            32,
+            window,
+            ID_SAVE_BUTTON,
+        ),
+        font,
+    );
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "关闭",
+            button_style,
+            428,
+            440,
+            100,
+            32,
+            window,
+            ID_CLOSE_BUTTON,
+        ),
+        font,
+    );
+}
+
+/// 创建一个分组框（带标题的方框），用来把相关设置归到一组。
+unsafe fn create_group(
+    window: HWND,
+    title: &str,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    font: windows::Win32::Graphics::Gdi::HFONT,
+) {
+    let control = create_control(
+        WINDOW_EX_STYLE::default(),
         "BUTTON",
-        "创建文件夹监控（记录新建的文件夹）",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
-        40,
-        182,
-        420,
-        26,
-        window,
-        ID_MONITOR_DIR_CHECK,
-    );
-    set_font(monitor_dir, font);
-
-    let monitor_modify = create_control(
-        "BUTTON",
-        "修改文件监控（记录文件内容被修改，默认关闭）",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
-        40,
-        210,
-        420,
-        26,
-        window,
-        ID_MONITOR_MODIFY_CHECK,
-    );
-    set_font(monitor_modify, font);
-
-    let monitor_hint = create_control(
-        "STATIC",
-        "三个开关都关闭后立即停止监控，不再记录任何文件事件，也不占用 CPU；\n重新勾选后会立刻恢复记录。修改监控写入较频繁，默认不开启。",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
-        40,
-        240,
-        450,
-        40,
+        title,
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | BS_GROUPBOX as u32),
+        x,
+        y,
+        width,
+        height,
         window,
         0,
     );
-    set_font(monitor_hint, font);
-
-    // ---- 资源管理器右键菜单 ----
-    let shell_title = create_control(
-        "STATIC",
-        "资源管理器右键菜单（注册后可在右键菜单里查看文件来源）：",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
-        20,
-        288,
-        450,
-        22,
-        window,
-        0,
-    );
-    set_font(shell_title, font);
-
-    let register = create_control(
-        "BUTTON",
-        "注册右键菜单",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
-        40,
-        314,
-        130,
-        32,
-        window,
-        ID_REGISTER_SHELL_BUTTON,
-    );
-    set_font(register, font);
-
-    let unregister = create_control(
-        "BUTTON",
-        "注销右键菜单",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
-        190,
-        314,
-        130,
-        32,
-        window,
-        ID_UNREGISTER_SHELL_BUTTON,
-    );
-    set_font(unregister, font);
-
-    let save = create_control(
-        "BUTTON",
-        "保存",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
-        20,
-        380,
-        100,
-        34,
-        window,
-        ID_SAVE_BUTTON,
-    );
-    set_font(save, font);
-
-    let close = create_control(
-        "BUTTON",
-        "关闭",
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
-        140,
-        380,
-        100,
-        34,
-        window,
-        ID_CLOSE_BUTTON,
-    );
-    set_font(close, font);
+    set_font(control, font);
 }
 
 /// 创建一个子控件并返回句柄。
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_control(
+    ex_style: WINDOW_EX_STYLE,
     class: &str,
     text: &str,
     style: WINDOW_STYLE,
@@ -398,7 +494,7 @@ unsafe fn create_control(
     let instance = GetModuleHandleW(None).unwrap_or_default();
 
     CreateWindowExW(
-        WINDOW_EX_STYLE::default(),
+        ex_style,
         PCWSTR(class_name.as_ptr()),
         PCWSTR(text.as_ptr()),
         style,
@@ -414,8 +510,8 @@ unsafe fn create_control(
     .unwrap_or_default()
 }
 
-/// 给控件设置系统默认界面字体，避免出现很小的旧式点阵字体。
-unsafe fn set_font(control: HWND, font: windows::Win32::Graphics::Gdi::HGDIOBJ) {
+/// 给控件设置统一界面字体（微软雅黑 UI），避免出现很小的旧式点阵字体。
+unsafe fn set_font(control: HWND, font: windows::Win32::Graphics::Gdi::HFONT) {
     if !control.0.is_null() {
         SendMessageW(
             control,

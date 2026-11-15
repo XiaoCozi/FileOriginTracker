@@ -11,6 +11,7 @@ pub mod config;
 pub mod db;
 pub mod etw;
 pub mod history;
+pub mod note;
 pub mod process;
 pub mod settings;
 pub mod shell_menu;

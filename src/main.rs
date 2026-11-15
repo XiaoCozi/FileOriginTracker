@@ -314,6 +314,8 @@ fn main() -> Result<()> {
     // 11. 清理
     info!("正在退出...");
     etw::stop_monitoring();
+    // 释放界面统一字体与画刷（此时窗口已经全部销毁）。
+    file_origin_tracker_shell::util::release_ui_resources();
 
     Ok(())
 }

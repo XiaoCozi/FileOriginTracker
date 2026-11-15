@@ -1,12 +1,86 @@
 //! 通用小工具函数。
 
 use std::os::windows::process::CommandExt;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{FILETIME, HINSTANCE, SYSTEMTIME};
+use windows::Win32::Graphics::Gdi::{
+    CreateFontW, CreateSolidBrush, DeleteObject, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, HBRUSH, HFONT, OUT_DEFAULT_PRECIS,
+};
 use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Time::FileTimeToSystemTime;
 use windows::Win32::UI::WindowsAndMessaging::{LoadIconW, HICON, IDI_APPLICATION};
+
+/// 界面统一字体缓存（微软雅黑 UI 9pt）。
+static UI_FONT: AtomicIsize = AtomicIsize::new(0);
+/// 界面统一背景色画刷缓存（白色）。
+static UI_BRUSH: AtomicIsize = AtomicIsize::new(0);
+
+/// 取得界面统一字体。
+///
+/// 系统默认控件字体是「宋体 / 9pt」，在高分屏上又小又发虚；
+/// 换成「微软雅黑 UI」后中文显示更清晰，两个窗口的观感也统一。
+pub fn ui_font() -> HFONT {
+    let cached = UI_FONT.load(Ordering::SeqCst);
+    if cached != 0 {
+        return HFONT(cached as *mut core::ffi::c_void);
+    }
+
+    let face = wide("Microsoft YaHei UI");
+    let font = unsafe {
+        CreateFontW(
+            -13,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_DEFAULT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            DEFAULT_PITCH.0 as u32,
+            PCWSTR(face.as_ptr()),
+        )
+    };
+    UI_FONT.store(font.0 as isize, Ordering::SeqCst);
+    font
+}
+
+/// 取得界面统一背景画刷（白色）。
+///
+/// 处理 WM_CTLCOLORSTATIC / WM_CTLCOLOREDIT 时返回它，
+/// 让标签和输入框的背景与窗口保持一致，不会出现灰色块。
+pub fn ui_brush() -> HBRUSH {
+    let cached = UI_BRUSH.load(Ordering::SeqCst);
+    if cached != 0 {
+        return HBRUSH(cached as *mut core::ffi::c_void);
+    }
+    let brush = unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00FF_FFFF)) };
+    UI_BRUSH.store(brush.0 as isize, Ordering::SeqCst);
+    brush
+}
+
+/// 释放字体与画刷（程序退出前调用，避免资源泄漏告警）。
+pub fn release_ui_resources() {
+    let font = UI_FONT.swap(0, Ordering::SeqCst);
+    if font != 0 {
+        unsafe {
+            let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(font as *mut _));
+        }
+    }
+    let brush = UI_BRUSH.swap(0, Ordering::SeqCst);
+    if brush != 0 {
+        unsafe {
+            let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush as *mut _));
+        }
+    }
+}
 
 /// 把 Rust 字符串转换为 Windows API 需要的、以 0 结尾的 UTF-16 缓冲区。
 pub fn wide(value: &str) -> Vec<u16> {
