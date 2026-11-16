@@ -1,9 +1,10 @@
 //! ETW 文件事件监听模块。
 //!
-//! 监听 Microsoft-Windows-Kernel-File 的三类事件：
+//! 监听 Microsoft-Windows-Kernel-File 的事件：
 //! - CreateNewFile(30) / RenamePath(27)：新建文件、新建文件夹，以及
 //!   浏览器/QQ/微信“临时文件保存完成后改成最终文件名”的场景
 //! - Write(16)：文件内容被写入（修改监控，默认关闭）
+//! - DeleteFile(18)：文件 / 文件夹被删除（删除监控）
 //!
 //! Write 事件本身不带文件名，所以要用 Create 事件里记录的
 //! “文件对象指针 -> 路径”对应关系反查。这套映射只在 ETW 回调线程内使用，
@@ -51,14 +52,18 @@ const KERNEL_FILE_PROVIDER_GUID: GUID = GUID::from_values(
 
 /// 以下事件 ID 通过 `wevtutil gp Microsoft-Windows-Kernel-File /ge:true` 确认：
 /// - 12 = Create：打开或创建文件，用于建立“文件对象 -> 路径”映射，不上报
-/// - 13 = Cleanup、14 = Close：文件句柄关闭，用于清理映射
+/// - 13 = Cleanup：句柄清理（不处理，见 Close 的说明）
+/// - 14 = Close：文件对象释放，用于清理映射
 /// - 16 = Write：文件内容被写入，用于修改监控
+/// - 18 = DeleteFile：文件/文件夹被删除
 /// - 27 = RenamePath：重命名/移动后携带最终完整路径
 /// - 30 = CreateNewFile：真正新建了文件或目录
 const EVENT_ID_CREATE: u16 = 12;
+#[allow(dead_code)] // 仅作文档说明：Cleanup(13) 不参与处理
 const EVENT_ID_CLEANUP: u16 = 13;
 const EVENT_ID_CLOSE: u16 = 14;
 const EVENT_ID_WRITE: u16 = 16;
+const EVENT_ID_DELETE_FILE: u16 = 18;
 const EVENT_ID_RENAME_PATH: u16 = 27;
 const EVENT_ID_CREATE_NEW_FILE: u16 = 30;
 
@@ -87,11 +92,13 @@ const KERNEL_FILE_KEYWORD_ALL: u64 = 0xFFFFFFFFFFFFFFFF;
 const EVENT_CONTROL_CODE_ENABLE_PROVIDER: u32 = 1;
 const SESSION_NAME: &str = "FileOriginTrackerKernelFile";
 
-/// 事件类型：新建（文件/文件夹由工作线程判断）或修改。
+/// 事件类型：新建（文件/文件夹由工作线程判断）、修改或删除。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileAction {
     Create,
     Modify,
+    /// 删除文件 / 文件夹（具体类型由工作线程判断）。
+    Delete,
 }
 
 /// 发送给工作线程的一条精简事件。
@@ -117,16 +124,23 @@ static MONITOR_CREATE: AtomicBool = AtomicBool::new(true);
 /// 当前是否记录“文件修改”。
 static MONITOR_MODIFY: AtomicBool = AtomicBool::new(false);
 
+/// 当前是否记录“删除文件 / 删除文件夹”。
+static MONITOR_DELETE: AtomicBool = AtomicBool::new(true);
+
 thread_local! {
-    /// “文件对象指针 -> 文件路径”。Write 事件只有文件对象，没有文件名，
-    /// 必须靠这张表反查出是哪个文件被修改了。
+    /// “(进程 ID, 文件对象指针) -> 文件路径”。
+    ///
+    /// Write、DeleteFile 等事件只有文件对象、没有文件名，必须靠这张表反查。
+    /// 键里带上进程 ID 是因为内核会快速复用文件对象指针，如果只用指针，
+    /// 后续事件可能查到别的文件的路径，导致程序归属错乱。
     ///
     /// ETW 回调都在同一个线程里顺序执行，所以用 thread_local + RefCell
     /// 就够了，不需要 Mutex，避免每次写入都争锁。
-    static FILE_PATHS: RefCell<HashMap<usize, String>> = RefCell::new(HashMap::new());
+    static FILE_PATHS: RefCell<HashMap<(u32, usize), String>> = RefCell::new(HashMap::new());
 
     /// 记录每个文件对象上次上报修改的时间，用于 1 秒节流。
-    static WRITE_THROTTLE: RefCell<HashMap<usize, Instant>> = RefCell::new(HashMap::new());
+    static WRITE_THROTTLE: RefCell<HashMap<(u32, usize), Instant>> =
+        RefCell::new(HashMap::new());
 
     /// “PID -> 进程名/路径”缓存。
     ///
@@ -241,6 +255,10 @@ pub fn start_file_tracing(db: Database, config: Config) -> Result<EtwTraceHandle
         Ordering::SeqCst,
     );
     MONITOR_MODIFY.store(config.monitor_modify_file, Ordering::SeqCst);
+    MONITOR_DELETE.store(
+        config.monitor_delete_file || config.monitor_delete_dir,
+        Ordering::SeqCst,
+    );
 
     let (sender, receiver) = channel::<FileEvent>();
     if let Ok(mut slot) = EVENT_SENDER.lock() {
@@ -259,7 +277,7 @@ pub fn start_file_tracing(db: Database, config: Config) -> Result<EtwTraceHandle
         }
     });
 
-    info!("ETW 文件追踪已启动（新建文件/文件夹 + 可选的文件修改）");
+    info!("ETW 文件追踪已启动（新建、修改、删除事件按设置分别记录）");
     Ok(EtwTraceHandle {
         session_handle,
         running,
@@ -412,11 +430,16 @@ unsafe extern "system" fn on_event_record(record: *mut EVENT_RECORD) {
     match event_id {
         // 打开或新建：取出路径，建立“文件对象 -> 路径”映射。
         EVENT_ID_CREATE | EVENT_ID_CREATE_NEW_FILE => {
+            // 顺手把“PID -> 进程名”缓存起来。
+            // 删除事件往往在程序即将退出时才发出（例如 cmd 执行完 del/rmdir），
+            // 那时再按 PID 查进程已经查不到了，只能靠这里提前记住。
+            let _ = process_info_for(pid);
+
             let Some(file_path) = read_filename_from_userdata(user_data, user_data_len) else {
                 return;
             };
             if let Some(object) = read_file_object(user_data, user_data_len) {
-                remember_path(object, &file_path);
+                remember_path(pid, object, &file_path);
             }
 
             // Create(12) 打开已有文件时也会触发，只有 CreateNewFile(30)
@@ -431,7 +454,7 @@ unsafe extern "system" fn on_event_record(record: *mut EVENT_RECORD) {
                 return;
             };
             if let Some(object) = read_file_object(user_data, user_data_len) {
-                remember_path(object, &file_path);
+                remember_path(pid, object, &file_path);
             }
             if MONITOR_CREATE.load(Ordering::Relaxed) {
                 send_event(pid, file_path, FileAction::Create);
@@ -449,24 +472,47 @@ unsafe extern "system" fn on_event_record(record: *mut EVENT_RECORD) {
             else {
                 return;
             };
-            if !should_report_write(object) {
+            if !should_report_write(pid, object) {
                 return;
             }
-            if let Some(file_path) = lookup_path(object) {
+            if let Some(file_path) = lookup_path(pid, object) {
                 send_event(pid, file_path, FileAction::Modify);
             }
         }
-        // 句柄关闭：清理映射，避免内存一直增长。
-        // 兼容两种负载布局：Create 系列文件对象在 +0x00，
-        // Write / Cleanup / Close 系列在 +0x08。
-        EVENT_ID_CLEANUP | EVENT_ID_CLOSE => {
+        // 删除：DeleteFile(18)。负载里只有文件对象、没有文件名，所以用
+        // “文件对象 -> 路径”映射反查。删除前一定会先打开文件（Create 事件），
+        // 此时映射里还留着这条路径，取到后再交给工作线程写库。
+        EVENT_ID_DELETE_FILE => {
+            if !MONITOR_DELETE.load(Ordering::Relaxed) {
+                return;
+            }
+            // 不同事件类型负载里文件对象的位置可能不同（+0x00 或 +0x08），
+            // 两个位置都试一下，取先命中的那个。
             for offset in [0usize, WRITE_FILE_OBJECT_OFFSET] {
                 if let Some(object) = read_file_object_at(user_data, user_data_len, offset) {
+                    if let Some(file_path) = lookup_path(pid, object) {
+                        send_event(pid, file_path, FileAction::Delete);
+                        return;
+                    }
+                }
+            }
+        }
+        // 句柄收尾：清理映射，避免内存一直增长。
+        //
+        // 注意：删除文件时 Cleanup(13) 常常先于 DeleteFile(18) 到达，
+        // 如果在 Cleanup 就把映射删掉，等到删除事件时已经查不到路径了。
+        // 因此只在文件对象真正释放的 Close(14) 时才移除映射。
+        EVENT_ID_CLOSE => {
+            // 兼容两种负载布局：Create 系列文件对象在 +0x00，
+            // Write / Cleanup / Close 系列在 +0x08。
+            for offset in [0usize, WRITE_FILE_OBJECT_OFFSET] {
+                if let Some(object) = read_file_object_at(user_data, user_data_len, offset) {
+                    let key = (pid, object);
                     FILE_PATHS.with(|paths| {
-                        paths.borrow_mut().remove(&object);
+                        paths.borrow_mut().remove(&key);
                     });
                     WRITE_THROTTLE.with(|throttle| {
-                        throttle.borrow_mut().remove(&object);
+                        throttle.borrow_mut().remove(&key);
                     });
                 }
             }
@@ -501,27 +547,28 @@ unsafe fn read_file_object(user_data: *const core::ffi::c_void, data_len: usize)
 }
 
 /// 记录“文件对象 -> 路径”。条目过多时整体清空，防止长时间运行内存膨胀。
-fn remember_path(object: usize, file_path: &str) {
+fn remember_path(pid: u32, object: usize, file_path: &str) {
     FILE_PATHS.with(|paths| {
         let mut paths = paths.borrow_mut();
         if paths.len() >= MAX_TRACKED_FILES {
             paths.clear();
         }
-        paths.insert(object, file_path.to_string());
+        paths.insert((pid, object), file_path.to_string());
     });
 }
 
-/// 按文件对象查路径。
-fn lookup_path(object: usize) -> Option<String> {
-    FILE_PATHS.with(|paths| paths.borrow().get(&object).cloned())
+/// 按（进程，文件对象）查路径。
+fn lookup_path(pid: u32, object: usize) -> Option<String> {
+    FILE_PATHS.with(|paths| paths.borrow().get(&(pid, object)).cloned())
 }
 
 /// 同一个文件对象 1 秒内只允许上报一次修改。
-fn should_report_write(object: usize) -> bool {
+fn should_report_write(pid: u32, object: usize) -> bool {
     WRITE_THROTTLE.with(|throttle| {
         let mut throttle = throttle.borrow_mut();
         let now = Instant::now();
-        if let Some(last) = throttle.get(&object) {
+        let key = (pid, object);
+        if let Some(last) = throttle.get(&key) {
             if now.duration_since(*last) < MODIFY_THROTTLE {
                 return false;
             }
@@ -529,7 +576,7 @@ fn should_report_write(object: usize) -> bool {
         if throttle.len() >= MAX_TRACKED_FILES {
             throttle.clear();
         }
-        throttle.insert(object, now);
+        throttle.insert(key, now);
         true
     })
 }
@@ -555,6 +602,9 @@ fn send_event(pid: u32, file_path: String, action: FileAction) {
 }
 
 /// 取得进程名与完整路径，并按 PID 缓存。
+///
+/// 只缓存成功的结果：像 cmd.exe 这种执行完立刻退出的程序，如果在它退出后
+/// 才查询会失败，此时不能把“查询失败”也缓存下来，否则稍后重试也拿不到。
 fn process_info_for(pid: u32) -> Option<(String, String)> {
     let cached = PROCESS_INFO.with(|cache| cache.borrow().get(&pid).cloned());
     if let Some(cached) = cached {
@@ -566,14 +616,16 @@ fn process_info_for(pid: u32) -> Option<(String, String)> {
         .flatten()
         .map(|process| (process.name, process.path));
 
-    PROCESS_INFO.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        // 防止长时间运行后缓存无限增长。
-        if cache.len() >= 4096 {
-            cache.clear();
-        }
-        cache.insert(pid, info.clone());
-    });
+    if info.is_some() {
+        PROCESS_INFO.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            // 防止长时间运行后缓存无限增长。
+            if cache.len() >= 4096 {
+                cache.clear();
+            }
+            cache.insert(pid, info.clone());
+        });
+    }
 
     info
 }
@@ -712,9 +764,15 @@ fn process_events(receiver: Receiver<FileEvent>, db: Database, config: Config) {
             continue;
         }
 
-        // 新建事件需要区分文件还是文件夹：直接看磁盘上的真实类型。
-        // 如果文件已经被删除，就按“文件”处理。
-        let is_directory = event.action == FileAction::Create && Path::new(&file_path).is_dir();
+        // 新建 / 删除事件需要区分文件还是文件夹：直接看磁盘上的真实类型。
+        // 删除时文件可能已经被移除，再看一眼数据库里记录的类型（建过文件夹的路径）。
+        let is_directory = match event.action {
+            FileAction::Create => Path::new(&file_path).is_dir(),
+            FileAction::Delete => {
+                Path::new(&file_path).is_dir() || db.path_is_known_directory(&file_path)
+            }
+            FileAction::Modify => false,
+        };
 
         // 按用户勾选的监控范围过滤。
         match event.action {
@@ -736,10 +794,20 @@ fn process_events(receiver: Receiver<FileEvent>, db: Database, config: Config) {
                     continue;
                 }
             }
+            FileAction::Delete => {
+                if is_directory && !config.monitor_delete_dir {
+                    continue;
+                }
+                if !is_directory && !config.monitor_delete_file {
+                    continue;
+                }
+            }
         }
 
-        // 优先使用 ETW 回调里当场解析好的进程信息（对短命进程也有效）。
-        // 只有当回调里没取到时，才在写库线程再尝试一次。
+        // 解析是哪个程序做的。
+        // 删除事件有个特殊情况：cmd.exe 这类程序执行完 del / rmdir 立刻退出，
+        // 等我们处理到事件时已经查不到进程名了。为了不丢记录，
+        // 删除事件查不到程序时仍然记录，程序名标注为未知（附上 PID 便于排查）。
         let process = match (&event.process_name, &event.process_path) {
             (Some(name), Some(path)) => Some((name.clone(), path.clone())),
             _ => match process_cache.get(&event.pid) {
@@ -760,8 +828,14 @@ fn process_events(receiver: Receiver<FileEvent>, db: Database, config: Config) {
             },
         };
 
-        let Some((process_name, process_path)) = process else {
-            continue;
+        let (process_name, process_path) = match process {
+            Some(process) => process,
+            None => {
+                if event.action != FileAction::Delete {
+                    continue;
+                }
+                (format!("未知进程（PID {}）", event.pid), String::new())
+            }
         };
 
         // 黑白名单过滤：黑名单里命中的程序/文件夹不记录，
@@ -775,6 +849,9 @@ fn process_events(receiver: Receiver<FileEvent>, db: Database, config: Config) {
                 db.upsert_origin(&file_path, &process_name, &process_path, is_directory)
             }
             FileAction::Modify => db.upsert_modification(&file_path, &process_name, &process_path),
+            FileAction::Delete => {
+                db.upsert_deletion(&file_path, &process_name, &process_path, is_directory)
+            }
         };
 
         if let Err(error) = result {

@@ -9,7 +9,8 @@
 //! - 顶部同一行工具栏：搜索框（按程序名 / 路径 / 类型实时过滤）+「起 / 止」两个
 //!   复选框与时间框（勾上才按该端时间过滤，精确到秒）
 //! - 点击列头按该列排序，再点一次切换升序 / 降序
-//! - 「类型」列按记录种类显示彩色底：新建文件=天蓝、新建文件夹=青绿、修改文件=橙
+//! - 「类型」列按记录种类显示彩色底：新建文件=天蓝、新建文件夹=青绿、
+//!   修改文件=浅紫、删除文件=红、删除文件夹=橙
 //! - 双击「创建程序」列打开程序所在目录，双击「路径」列打开文件所在目录
 //! - 在记录上点右键弹出菜单：打开文件路径 / 复制词条 / 打开创建程序所在目录
 
@@ -131,19 +132,30 @@ const TYPE_COLUMN: i32 = 3;
 /// COLORREF 的字节顺序是 0x00BBGGRR（蓝、绿、红），不是常见的 RGB，
 /// 所以这里都按 BGR 写，注释里给出对应的 RGB 方便对照。
 ///
-/// - 新建文件   ：天蓝 RGB(135, 206, 235)
-/// - 新建文件夹 ：青绿 RGB(32, 178, 170)
-/// - 修改文件   ：橙   RGB(255, 165, 0)
+/// - 新建文件   ：天蓝   RGB(135, 206, 235)
+/// - 新建文件夹 ：青绿   RGB(32, 178, 170)
+/// - 修改文件   ：浅紫   RGB(224, 200, 240)
+/// - 删除文件   ：红     RGB(219, 60, 71)
+/// - 删除文件夹 ：橙     RGB(255, 165, 0)
 fn type_cell_color(action: &str) -> COLORREF {
     match action {
-        "create_dir" => COLORREF(0x00AA_B220), // 青绿
-        "modify" => COLORREF(0x0000_A5FF),     // 橙
-        _ => COLORREF(0x00EB_CE87),            // 天蓝（新建文件）
+        "create_dir" => COLORREF(0x00AA_B220),  // 青绿
+        "modify" => COLORREF(0x00F0_C8E0),      // 浅紫
+        "delete_file" => COLORREF(0x0047_3CDB), // 红
+        "delete_dir" => COLORREF(0x0000_A5FF),  // 橙
+        _ => COLORREF(0x00EB_CE87),             // 天蓝（新建文件）
     }
 }
 
-/// 单元格背景是浅色，文字统一用深灰，保证对比度足够。
-const TYPE_CELL_TEXT_COLOR: COLORREF = COLORREF(0x0020_2020);
+/// 单元格文字颜色。
+///
+/// 浅色底用深灰字；「删除文件」是深红底，必须换成白字才看得清。
+fn type_cell_text_color(action: &str) -> COLORREF {
+    match action {
+        "delete_file" => COLORREF(0x00FF_FFFF), // 白
+        _ => COLORREF(0x0020_2020),             // 深灰
+    }
+}
 
 /// 编辑框内容变化时向父窗口发送的通知码（commctrl 之外的 Windows 标准通知）。
 const EN_CHANGE_CODE: u32 = 0x0300;
@@ -1044,7 +1056,7 @@ unsafe fn handle_custom_draw(lparam: LPARAM) -> LRESULT {
             .unwrap_or_default();
 
         custom.clrTextBk = type_cell_color(&action);
-        custom.clrText = TYPE_CELL_TEXT_COLOR;
+        custom.clrText = type_cell_text_color(&action);
         return LRESULT(CDRF_NEWFONT as isize);
     }
 
@@ -1325,6 +1337,8 @@ fn action_label(action: &str) -> String {
     match action {
         "create_dir" => "新建文件夹".to_string(),
         "modify" => "修改文件".to_string(),
+        "delete_file" => "删除文件".to_string(),
+        "delete_dir" => "删除文件夹".to_string(),
         _ => "新建文件".to_string(),
     }
 }

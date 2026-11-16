@@ -39,6 +39,12 @@ pub struct Config {
     /// 写入事件数量非常大，所以默认关闭，需要用户在设置里主动开启。
     #[serde(default)]
     pub monitor_modify_file: bool,
+    /// 是否记录“删除文件”。
+    #[serde(default = "default_true")]
+    pub monitor_delete_file: bool,
+    /// 是否记录“删除文件夹”。
+    #[serde(default = "default_true")]
+    pub monitor_delete_dir: bool,
     /// 黑白名单模式：`black` 表示黑名单，`white` 表示白名单。
     ///
     /// 名单具体条目存在数据库的 `list_entries` 表里，配置文件只保存当前模式。
@@ -100,16 +106,22 @@ impl Config {
             monitor_create_file: true,
             monitor_create_dir: true,
             monitor_modify_file: false,
+            monitor_delete_file: true,
+            monitor_delete_dir: true,
             list_mode: default_list_mode(),
         };
         config.save()?;
         Ok(config)
     }
 
-    /// 三个监控开关中是否至少有一个开启。
+    /// 所有监控开关中是否至少有一个开启。
     /// 全部关闭时完全停止 ETW 会话，避免空转占用 CPU。
     pub fn any_monitor_enabled(&self) -> bool {
-        self.monitor_create_file || self.monitor_create_dir || self.monitor_modify_file
+        self.monitor_create_file
+            || self.monitor_create_dir
+            || self.monitor_modify_file
+            || self.monitor_delete_file
+            || self.monitor_delete_dir
     }
 
     /// 当前是否为白名单模式（配置里出现无法识别的值时一律按黑名单处理）。

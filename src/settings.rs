@@ -51,6 +51,9 @@ const ID_CLOSE_BUTTON: usize = 2005;
 const ID_MONITOR_DIR_CHECK: usize = 2006;
 /// 监控开关：修改文件。
 const ID_MONITOR_MODIFY_CHECK: usize = 2007;
+/// 监控开关：删除文件 / 删除文件夹。
+const ID_MONITOR_DELETE_FILE_CHECK: usize = 2011;
+const ID_MONITOR_DELETE_DIR_CHECK: usize = 2012;
 /// 注册 / 注销资源管理器右键菜单（从托盘菜单移到这里）。
 const ID_REGISTER_SHELL_BUTTON: usize = 2008;
 const ID_UNREGISTER_SHELL_BUTTON: usize = 2009;
@@ -95,7 +98,7 @@ pub fn show() -> Result<()> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             560,
-            618,
+            672,
             HWND::default(),
             HMENU::default(),
             instance,
@@ -316,7 +319,7 @@ unsafe fn create_controls(window: HWND) {
         16,
         174,
         512,
-        154,
+        206,
         font,
     );
     set_font(
@@ -367,11 +370,41 @@ unsafe fn create_controls(window: HWND) {
     set_font(
         create_control(
             WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "删除文件监控（记录被删除的文件）",
+            check_style,
+            34,
+            274,
+            460,
+            24,
+            window,
+            ID_MONITOR_DELETE_FILE_CHECK,
+        ),
+        font,
+    );
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "删除文件夹监控（记录被删除的文件夹）",
+            check_style,
+            34,
+            300,
+            460,
+            24,
+            window,
+            ID_MONITOR_DELETE_DIR_CHECK,
+        ),
+        font,
+    );
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
             "STATIC",
-            "三个开关都关闭后立即停止监控，不再记录任何文件事件，也不占用 CPU；\n修改监控写入较频繁，默认不开启。",
+            "五个开关都关闭后立即停止监控，不再记录任何文件事件，也不占用 CPU；\n修改监控写入较频繁，默认不开启。",
             label_style,
             34,
-            276,
+            328,
             470,
             40,
             window,
@@ -381,7 +414,7 @@ unsafe fn create_controls(window: HWND) {
     );
 
     // ---- 分组 4：名单模式 ----
-    create_group(window, "黑白名单模式", 16, 336, 512, 80, font);
+    create_group(window, "黑白名单模式", 16, 388, 512, 80, font);
     set_font(
         create_control(
             WINDOW_EX_STYLE::default(),
@@ -391,7 +424,7 @@ unsafe fn create_controls(window: HWND) {
                 WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32 | 0x8, // WS_GROUP
             ),
             34,
-            352,
+            404,
             80,
             24,
             window,
@@ -406,7 +439,7 @@ unsafe fn create_controls(window: HWND) {
             "白名单",
             WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32),
             120,
-            352,
+            404,
             80,
             24,
             window,
@@ -421,7 +454,7 @@ unsafe fn create_controls(window: HWND) {
             "黑名单：不记录名单里的程序 / 文件夹\n白名单：只记录名单里的程序 / 文件夹",
             label_style,
             34,
-            376,
+            428,
             350,
             36,
             window,
@@ -436,7 +469,7 @@ unsafe fn create_controls(window: HWND) {
             "管理名单…",
             button_style,
             400,
-            376,
+            428,
             110,
             30,
             window,
@@ -446,7 +479,7 @@ unsafe fn create_controls(window: HWND) {
     );
 
     // ---- 分组 5：资源管理器右键菜单 ----
-    create_group(window, "资源管理器右键菜单", 16, 424, 512, 88, font);
+    create_group(window, "资源管理器右键菜单", 16, 476, 512, 88, font);
     set_font(
         create_control(
             WINDOW_EX_STYLE::default(),
@@ -454,7 +487,7 @@ unsafe fn create_controls(window: HWND) {
             "注册后可以在文件 / 文件夹上右键，查看它的创建来源。",
             label_style,
             34,
-            444,
+            496,
             470,
             20,
             window,
@@ -469,7 +502,7 @@ unsafe fn create_controls(window: HWND) {
             "注册右键菜单",
             button_style,
             34,
-            470,
+            522,
             120,
             30,
             window,
@@ -484,7 +517,7 @@ unsafe fn create_controls(window: HWND) {
             "注销右键菜单",
             button_style,
             170,
-            470,
+            522,
             120,
             30,
             window,
@@ -501,7 +534,7 @@ unsafe fn create_controls(window: HWND) {
             "保存",
             button_style,
             316,
-            528,
+            580,
             100,
             32,
             window,
@@ -516,7 +549,7 @@ unsafe fn create_controls(window: HWND) {
             "关闭",
             button_style,
             428,
-            528,
+            580,
             100,
             32,
             window,
@@ -604,11 +637,13 @@ fn load_values(window: HWND) {
         return;
     };
     log::info!(
-        "[设置] 载入：保留 {} 天，监控（创建文件={} 创建文件夹={} 修改文件={}）",
+        "[设置] 载入：保留 {} 天，监控（创建文件={} 创建文件夹={} 修改文件={} 删除文件={} 删除文件夹={}）",
         config.retention_days,
         config.monitor_create_file,
         config.monitor_create_dir,
-        config.monitor_modify_file
+        config.monitor_modify_file,
+        config.monitor_delete_file,
+        config.monitor_delete_dir
     );
 
     unsafe {
@@ -647,6 +682,22 @@ fn load_values(window: HWND) {
             LPARAM(0),
         );
 
+        let monitor_delete_file = child(window, ID_MONITOR_DELETE_FILE_CHECK);
+        SendMessageW(
+            monitor_delete_file,
+            BM_SETCHECK,
+            WPARAM(if config.monitor_delete_file { 1 } else { 0 }),
+            LPARAM(0),
+        );
+
+        let monitor_delete_dir = child(window, ID_MONITOR_DELETE_DIR_CHECK);
+        SendMessageW(
+            monitor_delete_dir,
+            BM_SETCHECK,
+            WPARAM(if config.monitor_delete_dir { 1 } else { 0 }),
+            LPARAM(0),
+        );
+
         // 黑白名单模式：两个单选框只能有一个选中。
         let white = config.is_white_list();
         SendMessageW(
@@ -679,6 +730,8 @@ fn save_and_apply(window: HWND) {
     let monitor_file = read_check(window, ID_MONITOR_FILE_CHECK);
     let monitor_dir = read_check(window, ID_MONITOR_DIR_CHECK);
     let monitor_modify = read_check(window, ID_MONITOR_MODIFY_CHECK);
+    let monitor_delete_file = read_check(window, ID_MONITOR_DELETE_FILE_CHECK);
+    let monitor_delete_dir = read_check(window, ID_MONITOR_DELETE_DIR_CHECK);
     // 白名单单选框被选中就是白名单模式，否则黑名单。
     let list_mode = if read_check(window, ID_WHITELIST_RADIO) {
         crate::list_rules::MODE_WHITE
@@ -686,13 +739,15 @@ fn save_and_apply(window: HWND) {
         crate::list_rules::MODE_BLACK
     };
     log::info!(
-        "[设置] 保存：保留天数文本={:?} 天数={} 开机自启={} 监控（创建文件={} 创建文件夹={} 修改文件={}）名单模式={}",
+        "[设置] 保存：保留天数文本={:?} 天数={} 开机自启={} 监控（创建文件={} 创建文件夹={} 修改文件={} 删除文件={} 删除文件夹={}）名单模式={}",
         days_text,
         days,
         autostart,
         monitor_file,
         monitor_dir,
         monitor_modify,
+        monitor_delete_file,
+        monitor_delete_dir,
         list_mode
     );
 
@@ -707,6 +762,8 @@ fn save_and_apply(window: HWND) {
     config.monitor_create_file = monitor_file;
     config.monitor_create_dir = monitor_dir;
     config.monitor_modify_file = monitor_modify;
+    config.monitor_delete_file = monitor_delete_file;
+    config.monitor_delete_dir = monitor_delete_dir;
     config.list_mode = list_mode.to_string();
 
     if let Err(error) = config.save() {
@@ -768,9 +825,9 @@ fn save_and_apply(window: HWND) {
     }
 }
 
-/// 按三个开关的当前状态启动或停止文件监控。
+/// 按监控开关的当前状态启动或停止文件监控。
 ///
-/// - 三个都关闭：停止 ETW 会话，彻底不再接收事件。
+/// - 全部关闭：停止 ETW 会话，彻底不再接收事件。
 /// - 至少一个开启：重新启动 ETW 会话，让新的过滤条件立即生效
 ///   （`start_monitoring` 内部会先停止旧会话）。
 fn apply_monitor(config: &Config) -> Result<()> {
@@ -795,6 +852,12 @@ fn monitor_summary(config: &Config) -> String {
     }
     if config.monitor_modify_file {
         parts.push("修改文件");
+    }
+    if config.monitor_delete_file {
+        parts.push("删除文件");
+    }
+    if config.monitor_delete_dir {
+        parts.push("删除文件夹");
     }
     if parts.is_empty() {
         "全部关闭".to_string()

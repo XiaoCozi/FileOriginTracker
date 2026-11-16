@@ -29,7 +29,8 @@ pub struct FileOrigin {
     /// 创建时间戳（Unix 秒），修改记录里是最后修改时间
     pub created_at: i64,
     /// 事件类型："create_file"（新建文件）、"create_dir"（新建文件夹）、
-    /// "modify"（文件被修改）。列表里用来显示类型列。
+    /// "modify"（文件被修改）、"delete_file"（删除文件）、"delete_dir"（删除文件夹）。
+    /// 列表里用来显示类型列。
     pub action: String,
     /// 用户给这个程序起的备注（没有备注时为空字符串）。
     ///
@@ -73,6 +74,17 @@ impl Database {
                 modified_at   INTEGER NOT NULL
             );
 
+            -- 删除记录：和新建记录分开存。
+            -- 如果复用 file_origins，删除事件会把“谁创建的”这条记录覆盖掉，
+            -- 所以单独建表，让创建和删除两条信息都能保留。
+            CREATE TABLE IF NOT EXISTS file_deletions (
+                file_path     TEXT PRIMARY KEY,
+                process_name  TEXT NOT NULL,
+                process_path  TEXT NOT NULL,
+                deleted_at    INTEGER NOT NULL,
+                is_directory  INTEGER NOT NULL DEFAULT 0
+            );
+
             -- 为进程名建索引，方便按程序查询
             CREATE INDEX IF NOT EXISTS idx_process_name 
                 ON file_origins(process_name);
@@ -83,6 +95,9 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_modified_at
                 ON file_modifications(modified_at);
+
+            CREATE INDEX IF NOT EXISTS idx_deleted_at
+                ON file_deletions(deleted_at);
 
             -- 程序备注：给某个程序（按完整路径区分）加一句说明，
             -- 之后该程序的所有监控记录都会显示这句备注。
@@ -203,6 +218,56 @@ impl Database {
         Ok(())
     }
 
+    /// 插入或更新一条“删除文件 / 删除文件夹”记录。
+    /// 同一个路径只保留最后一次删除，避免重复删除事件把表撑大。
+    pub fn upsert_deletion(
+        &self,
+        file_path: &str,
+        process_name: &str,
+        process_path: &str,
+        is_directory: bool,
+    ) -> Result<()> {
+        let conn = self.lock_connection();
+        let now = chrono_now();
+
+        conn.execute(
+            r#"
+            INSERT INTO file_deletions
+                (file_path, process_name, process_path, deleted_at, is_directory)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(file_path) DO UPDATE SET
+                process_name = excluded.process_name,
+                process_path = excluded.process_path,
+                deleted_at   = excluded.deleted_at,
+                is_directory = excluded.is_directory
+            "#,
+            params![
+                file_path,
+                process_name,
+                process_path,
+                now,
+                if is_directory { 1 } else { 0 }
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// 这个路径曾经作为文件夹被记录过吗？
+    ///
+    /// 删除事件处理时文件夹可能已经从磁盘上消失，`Path::is_dir()` 就拿不到真实类型了。
+    /// 这时查一下新建记录里保存的 is_directory，能把“删除文件夹”正确区分出来。
+    pub fn path_is_known_directory(&self, file_path: &str) -> bool {
+        let conn = self.lock_connection();
+        conn.query_row(
+            "SELECT is_directory FROM file_origins WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .unwrap_or(false)
+    }
+
     /// 根据文件路径查询它的创建来源
     pub fn get_origin(&self, file_path: &str) -> Result<Option<FileOrigin>> {
         let conn = self.lock_connection();
@@ -282,6 +347,10 @@ impl Database {
                 SELECT file_path, process_name, process_path, modified_at AS created_at,
                        'modify' AS action
                 FROM file_modifications
+                UNION ALL
+                SELECT file_path, process_name, process_path, deleted_at AS created_at,
+                       CASE WHEN is_directory <> 0 THEN 'delete_dir' ELSE 'delete_file' END AS action
+                FROM file_deletions
             ) AS t
             LEFT JOIN program_notes n ON n.process_path = t.process_path
             WHERE t.file_path <> '' AND t.process_name <> '' AND t.process_path <> ''
@@ -323,8 +392,12 @@ impl Database {
             "DELETE FROM file_modifications WHERE modified_at < ?1",
             params![cutoff],
         )?;
+        let deletions = conn.execute(
+            "DELETE FROM file_deletions WHERE deleted_at < ?1",
+            params![cutoff],
+        )?;
 
-        Ok((origins + modifications) as i64)
+        Ok((origins + modifications + deletions) as i64)
     }
 
     /// 日常维护：按保留天数删除旧记录，并在确实删过数据时压缩数据库文件。
@@ -547,6 +620,40 @@ mod tests {
             .unwrap();
         assert_eq!(old.len(), 1);
         assert_eq!(old[0].file_path, r"C:\old.txt");
+    }
+
+    /// 验证删除记录：文件/文件夹分别映射成 delete_file / delete_dir，
+    /// 并且删除记录不会覆盖同一路径的新建记录。
+    #[test]
+    fn deletion_records_keep_origin_and_expose_action() {
+        let dir = std::env::temp_dir().join("file_origin_tracker_db_test_delete");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Database::init(&dir).unwrap();
+
+        db.upsert_origin(r"C:\a.txt", "a.exe", r"C:\a.exe", false)
+            .unwrap();
+        db.upsert_origin(r"C:\folder", "a.exe", r"C:\a.exe", true)
+            .unwrap();
+        db.upsert_deletion(r"C:\a.txt", "b.exe", r"C:\b.exe", false)
+            .unwrap();
+        db.upsert_deletion(r"C:\folder", "b.exe", r"C:\b.exe", true)
+            .unwrap();
+
+        // 删除记录单独存表，原来的新建记录还在。
+        let origins = db.recent_filtered(50, None).unwrap();
+        assert!(origins
+            .iter()
+            .any(|row| row.file_path == r"C:\a.txt" && row.action == "create_file"));
+        assert!(origins
+            .iter()
+            .any(|row| row.file_path == r"C:\a.txt" && row.action == "delete_file"));
+        assert!(origins
+            .iter()
+            .any(|row| row.file_path == r"C:\folder" && row.action == "delete_dir"));
+
+        // 建过文件夹的路径能被识别出来，供删除事件判断类型时兜底。
+        assert!(db.path_is_known_directory(r"C:\folder"));
+        assert!(!db.path_is_known_directory(r"C:\a.txt"));
     }
 
     /// 验证名单条目能在黑名单 / 白名单之间来回切换，
