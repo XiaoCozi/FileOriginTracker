@@ -9,9 +9,9 @@ use windows::Win32::Graphics::Gdi::{
     CreateFontW, CreateSolidBrush, DeleteObject, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     DEFAULT_CHARSET, DEFAULT_PITCH, HBRUSH, HFONT, OUT_DEFAULT_PRECIS,
 };
-use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+use windows::Win32::Storage::FileSystem::{FileTimeToLocalFileTime, LocalFileTimeToFileTime};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Time::FileTimeToSystemTime;
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime};
 use windows::Win32::UI::WindowsAndMessaging::{LoadIconW, HICON, IDI_APPLICATION};
 
 /// 界面统一字体缓存（微软雅黑 UI 9pt）。
@@ -190,4 +190,70 @@ pub fn timestamp_to_local_text(unix_seconds: i64) -> String {
     }
 
     String::from("未知时间")
+}
+
+/// 把「本地时间的 SYSTEMTIME」换算成 Unix 时间戳（秒）。
+///
+/// 用于「最近记录」窗口的时间筛选：日期时间框给的 SYSTEMTIME 是本地时间，
+/// 数据库里存的是 UTC 时间戳，需要先转成 FILETIME 再转 UTC 后相减。
+/// 任何一步失败都返回 `None`，调用方按“没有筛选”处理。
+pub fn local_system_time_to_unix(system_time: &SYSTEMTIME) -> Option<i64> {
+    // 1601-01-01 到 1970-01-01 之间的秒数差
+    const SECONDS_BETWEEN_1601_AND_1970: i64 = 11_644_473_600;
+
+    let mut local_file_time = FILETIME::default();
+    let mut utc_file_time = FILETIME::default();
+    unsafe {
+        SystemTimeToFileTime(system_time, &mut local_file_time).ok()?;
+        LocalFileTimeToFileTime(&local_file_time, &mut utc_file_time).ok()?;
+    }
+
+    // FILETIME 的高 / 低 32 位拼成 100 纳秒单位的整数，再换算成秒。
+    let ticks = ((utc_file_time.dwHighDateTime as i64) << 32) | utc_file_time.dwLowDateTime as i64;
+    Some(ticks / 10_000_000 - SECONDS_BETWEEN_1601_AND_1970)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Unix 时间戳 → 本地时间文本 → 再换回 Unix 秒，应该基本不变（容差 2 秒）。
+    #[test]
+    fn local_system_time_conversion_roundtrip() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // timestamp_to_local_text 固定输出 "YYYY-MM-DD HH:MM:SS"。
+        let text = timestamp_to_local_text(now);
+        let mut halves = text.split(' ');
+        let date = halves.next().expect("缺少日期部分");
+        let clock = halves.next().expect("缺少时间部分");
+        let date_parts: Vec<u16> = date
+            .split('-')
+            .map(|part| part.parse().expect("日期格式错误"))
+            .collect();
+        let clock_parts: Vec<u16> = clock
+            .split(':')
+            .map(|part| part.parse().expect("时间格式错误"))
+            .collect();
+
+        let system_time = SYSTEMTIME {
+            wYear: date_parts[0],
+            wMonth: date_parts[1],
+            wDay: date_parts[2],
+            wHour: clock_parts[0],
+            wMinute: clock_parts[1],
+            wSecond: clock_parts[2],
+            ..Default::default()
+        };
+
+        let converted = local_system_time_to_unix(&system_time).expect("本地时间换算失败");
+        assert!(
+            (converted - now).abs() <= 2,
+            "换算结果是 {converted}，原时间戳是 {now}"
+        );
+    }
 }

@@ -251,9 +251,25 @@ impl Database {
     /// 新建记录和修改记录在两张表里，这里用 UNION ALL 合并后统一按时间排序，
     /// `action` 列告诉界面这是新建文件、新建文件夹还是修改文件。
     pub fn recent(&self, limit: u32) -> Result<Vec<FileOrigin>> {
+        self.recent_filtered(limit, None)
+    }
+
+    /// 与 [`Database::recent`] 相同，但可以限定时间范围（Unix 秒，含首尾）。
+    ///
+    /// `range` 为 `None` 时不限时间；`Some((start, end))` 时只返回这个区间内的记录，
+    /// 供「最近记录」窗口按年月日时分秒筛选使用。
+    pub fn recent_filtered(
+        &self,
+        limit: u32,
+        range: Option<(i64, i64)>,
+    ) -> Result<Vec<FileOrigin>> {
         let conn = self.lock_connection();
-        // 过滤掉没有程序信息的空记录：这类记录没有追踪价值，
-        // 只会在列表里显示成一堆只有时间、内容空白的行。
+        // 没有时间范围时传 NULL，SQL 里用 `?2 IS NULL` 跳过时间条件，
+        // 这样只用一条语句就能同时支持“全部记录”和“指定时间段”两种查询。
+        let (start, end) = match range {
+            Some((start, end)) => (Some(start), Some(end)),
+            None => (None, None),
+        };
         let mut stmt = conn.prepare(
             r#"
             SELECT t.file_path, t.process_name, t.process_path, t.created_at, t.action,
@@ -269,12 +285,13 @@ impl Database {
             ) AS t
             LEFT JOIN program_notes n ON n.process_path = t.process_path
             WHERE t.file_path <> '' AND t.process_name <> '' AND t.process_path <> ''
+              AND (?2 IS NULL OR (t.created_at >= ?2 AND t.created_at <= ?3))
             ORDER BY t.created_at DESC
             LIMIT ?1
             "#,
         )?;
 
-        let rows = stmt.query_map(params![limit], |row| {
+        let rows = stmt.query_map(params![limit, start, end], |row| {
             Ok(FileOrigin {
                 file_path: row.get(0)?,
                 process_name: row.get(1)?,
@@ -490,6 +507,47 @@ fn chrono_now() -> i64 {
 mod tests {
     use super::*;
     use crate::list_rules::{MODE_BLACK, MODE_WHITE};
+
+    /// 验证按时间范围查询：只返回区间内的记录，不带范围时返回全部。
+    #[test]
+    fn recent_filtered_respects_time_range() {
+        let dir = std::env::temp_dir().join("file_origin_tracker_db_test_range");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Database::init(&dir).unwrap();
+
+        let now = chrono_now();
+        db.upsert_origin(r"C:\old.txt", "a.exe", r"C:\a.exe", false)
+            .unwrap();
+        db.upsert_origin(r"C:\new.txt", "b.exe", r"C:\b.exe", false)
+            .unwrap();
+
+        // 手动把 old.txt 的创建时间改成 10 天前。
+        {
+            let conn = db.lock_connection();
+            conn.execute(
+                "UPDATE file_origins SET created_at = ?1 WHERE file_path = ?2",
+                params![now - 10 * 86400, r"C:\old.txt"],
+            )
+            .unwrap();
+        }
+
+        // 不带时间范围：两条都在。
+        assert_eq!(db.recent_filtered(50, None).unwrap().len(), 2);
+
+        // 只查最近 1 小时：只剩 new.txt。
+        let recent = db
+            .recent_filtered(50, Some((now - 3600, now + 3600)))
+            .unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].file_path, r"C:\new.txt");
+
+        // 只查 9~11 天前：只剩 old.txt。
+        let old = db
+            .recent_filtered(50, Some((now - 11 * 86400, now - 9 * 86400)))
+            .unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].file_path, r"C:\old.txt");
+    }
 
     /// 验证名单条目能在黑名单 / 白名单之间来回切换，
     /// 以及目标名单里已有同一路径时不会因主键冲突失败。

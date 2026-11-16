@@ -6,7 +6,10 @@
 //! 只有窗口处于激活状态时，才每 10 秒自动刷新一次列表。
 //!
 //! 交互：
-//! - 顶部搜索框按程序名 / 路径 / 类型实时过滤
+//! - 顶部同一行工具栏：搜索框（按程序名 / 路径 / 类型实时过滤）+「起 / 止」两个
+//!   复选框与时间框（勾上才按该端时间过滤，精确到秒）
+//! - 点击列头按该列排序，再点一次切换升序 / 降序
+//! - 「类型」列按记录种类显示彩色底：新建文件=天蓝、新建文件夹=青绿、修改文件=橙
 //! - 双击「创建程序」列打开程序所在目录，双击「路径」列打开文件所在目录
 //! - 在记录上点右键弹出菜单：打开文件路径 / 复制词条 / 打开创建程序所在目录
 
@@ -18,7 +21,7 @@ use std::sync::Mutex;
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{ScreenToClient, SetBkColor, SetTextColor, UpdateWindow};
 use windows::Win32::System::DataExchange::{
@@ -27,23 +30,27 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED,
-    LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST,
-    LVN_ITEMACTIVATE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_REPORT,
-    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NM_RCLICK,
+    InitCommonControlsEx, BST_CHECKED, BST_UNCHECKED, CDDS_ITEMPREPAINT, CDDS_PREPAINT,
+    CDDS_SUBITEM, CDRF_DODEFAULT, CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW,
+    DTM_GETSYSTEMTIME, DTM_SETFORMATW, ICC_DATE_CLASSES, ICC_LISTVIEW_CLASSES,
+    INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
+    LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
+    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST, LVN_COLUMNCLICK, LVN_ITEMACTIVATE,
+    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS,
+    LVS_SINGLESEL, NMHDR, NMLISTVIEW, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_RCLICK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetClientRect,
     GetCursorPos, GetMessageW, GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MessageBoxW,
     MoveWindow, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
-    ShowWindow, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG,
-    ICON_SMALL, IDC_ARROW, MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG,
-    SW_HIDE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE,
-    WINDOW_EX_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT,
-    WM_CTLCOLORSTATIC, WM_NOTIFY, WM_NULL, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSEXW,
-    WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
+    BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW,
+    MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL,
+    TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_NOTIFY,
+    WM_NULL, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::db::{Database, FileOrigin};
@@ -73,6 +80,16 @@ const LIST_STYLE: windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE =
 static HISTORY_WINDOW: AtomicIsize = AtomicIsize::new(0);
 static LIST_VIEW: AtomicIsize = AtomicIsize::new(0);
 static SEARCH_EDIT: AtomicIsize = AtomicIsize::new(0);
+/// 时间筛选的两个日期时间框（DateTimePicker）。
+static FILTER_START_PICKER: AtomicIsize = AtomicIsize::new(0);
+static FILTER_END_PICKER: AtomicIsize = AtomicIsize::new(0);
+/// 起、止两端各自是否启用（对应时间框左边的复选框）。
+static FILTER_START_ENABLE: AtomicIsize = AtomicIsize::new(0);
+static FILTER_END_ENABLE: AtomicIsize = AtomicIsize::new(0);
+/// 当前排序列：0=监控时间 1=程序 2=路径 3=类型。
+static SORT_COLUMN: AtomicIsize = AtomicIsize::new(0);
+/// 是否升序。默认 false：时间倒序，最新的记录在最上面。
+static SORT_ASCENDING: AtomicBool = AtomicBool::new(false);
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// 列表的列定义：（标题，宽度）。顺序必须和填充数据时使用的列下标一致。
@@ -90,6 +107,43 @@ const COLUMNS: [(&str, i32); 4] = [
 const LIST_CONTROL_ID: usize = 1;
 /// 搜索框的子窗口 ID。WM_COMMAND 里靠它区分搜索框的输入事件。
 const SEARCH_CONTROL_ID: usize = 2;
+/// 时间筛选控件 ID：起、止两个日期时间框和一个「清除筛选」按钮。
+const FILTER_START_PICKER_ID: usize = 3;
+const FILTER_END_PICKER_ID: usize = 4;
+const FILTER_CLEAR_BUTTON_ID: usize = 5;
+/// 起、止两端的启用复选框 ID。
+///
+/// 时间框自带的勾选框（DTS_SHOWNONE）又小又挤，看起来很不舒服，
+/// 所以改用独立的复选框：勾上才按该端时间筛选，不勾表示这一端不限。
+const FILTER_START_ENABLE_ID: usize = 6;
+const FILTER_END_ENABLE_ID: usize = 7;
+
+/// 日期时间框的值变化通知码（winuser.h 里的 DTN_DATETIMECHANGE = 0U-759U）。
+const DTN_DATETIMECHANGE_CODE: u32 = 0xFFFF_FD09;
+/// DTM_GETSYSTEMTIME 的返回码：0 表示拿到了有效时间。
+const GDT_VALID: isize = 0;
+
+/// 「类型」列的列下标（0 起）。
+const TYPE_COLUMN: i32 = 3;
+
+/// 「类型」列每种记录的单元格背景色。
+///
+/// COLORREF 的字节顺序是 0x00BBGGRR（蓝、绿、红），不是常见的 RGB，
+/// 所以这里都按 BGR 写，注释里给出对应的 RGB 方便对照。
+///
+/// - 新建文件   ：天蓝 RGB(135, 206, 235)
+/// - 新建文件夹 ：青绿 RGB(32, 178, 170)
+/// - 修改文件   ：橙   RGB(255, 165, 0)
+fn type_cell_color(action: &str) -> COLORREF {
+    match action {
+        "create_dir" => COLORREF(0x00AA_B220), // 青绿
+        "modify" => COLORREF(0x0000_A5FF),     // 橙
+        _ => COLORREF(0x00EB_CE87),            // 天蓝（新建文件）
+    }
+}
+
+/// 单元格背景是浅色，文字统一用深灰，保证对比度足够。
+const TYPE_CELL_TEXT_COLOR: COLORREF = COLORREF(0x0020_2020);
 
 /// 编辑框内容变化时向父窗口发送的通知码（commctrl 之外的 Windows 标准通知）。
 const EN_CHANGE_CODE: u32 = 0x0300;
@@ -105,7 +159,7 @@ const MENU_ADD_TO_LIST: u32 = 4005;
 /// 剪贴板文本格式（CF_UNICODETEXT）。
 const CF_UNICODETEXT: u32 = 13;
 
-/// 在搜索框下方给列表留出的高度（像素）。
+/// 顶部工具栏高度（像素）：搜索框和时间筛选在同一行。
 const TOOLBAR_HEIGHT: i32 = 36;
 
 /// 当前列表里显示的行数据。
@@ -226,6 +280,14 @@ unsafe extern "system" fn window_procedure(
                 _ if id == SEARCH_CONTROL_ID as u32 && code == EN_CHANGE_CODE => {
                     apply_filter();
                 }
+                // 清除时间筛选：两个复选框取消勾选，重新读取全部记录。
+                _ if id == FILTER_CLEAR_BUTTON_ID as u32 => {
+                    clear_time_filter();
+                }
+                // 「起 / 止」复选框被点击：按新的勾选状态立即刷新列表。
+                _ if id == FILTER_START_ENABLE_ID as u32 || id == FILTER_END_ENABLE_ID as u32 => {
+                    refresh_list();
+                }
                 MENU_OPEN_PATH => {
                     if let Some(row) = context_row() {
                         open_path_target(&row);
@@ -257,6 +319,15 @@ unsafe extern "system" fn window_procedure(
         }
         WM_NOTIFY => {
             let header = &*(lparam.0 as *const NMHDR);
+
+            // 时间筛选：任一日期时间框被勾选 / 修改时间，立即重新查询并刷新列表。
+            if (header.idFrom == FILTER_START_PICKER_ID || header.idFrom == FILTER_END_PICKER_ID)
+                && header.code == DTN_DATETIMECHANGE_CODE
+            {
+                refresh_list();
+                return LRESULT(0);
+            }
+
             if header.idFrom == LIST_CONTROL_ID {
                 let list = HWND(LIST_VIEW.load(Ordering::SeqCst) as *mut c_void);
                 match header.code {
@@ -295,6 +366,16 @@ unsafe extern "system" fn window_procedure(
                             select_row(list, index);
                             show_row_menu(hwnd, index);
                         }
+                    }
+                    LVN_COLUMNCLICK => {
+                        // 点击列头：按该列排序；再点同一列则切换升序 / 降序。
+                        let info = &*(lparam.0 as *const NMLISTVIEW);
+                        toggle_sort(info.iSubItem);
+                        apply_filter();
+                    }
+                    NM_CUSTOMDRAW => {
+                        // 自定义绘制：只为「类型」列刷彩色背景，其它列保持系统默认绘制。
+                        return handle_custom_draw(lparam);
                     }
                     _ => {}
                 }
@@ -347,7 +428,8 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     // 列表控件属于通用控件，必须先初始化。
     let controls = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_LISTVIEW_CLASSES,
+        // 列表控件 + 日期时间选择框都属于通用控件，必须先初始化。
+        dwICC: ICC_LISTVIEW_CLASSES | ICC_DATE_CLASSES,
     };
     let _ = InitCommonControlsEx(&controls);
 
@@ -384,7 +466,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
             | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(ES_AUTOHSCROLL as u32),
         56,
         8,
-        300,
+        240,
         24,
         window,
         HMENU(SEARCH_CONTROL_ID as *mut std::ffi::c_void),
@@ -393,6 +475,136 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     ) {
         SEARCH_EDIT.store(edit.0 as isize, Ordering::SeqCst);
         SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+
+    // ===== 同一行的右侧：时间筛选 =====
+    // 每个时间框左边有一个独立复选框：
+    // 勾上 = 按这一端的时间筛选，不勾 = 这一端不限时间，改动立即生效。
+    let filter_label_text = wide("筛选时间");
+    if let Ok(filter_label) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(label_class.as_ptr()),
+        PCWSTR(filter_label_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE,
+        312,
+        13,
+        60,
+        20,
+        window,
+        HMENU::default(),
+        instance,
+        None,
+    ) {
+        SendMessageW(filter_label, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+
+    // 两个「起 / 止」复选框：普通的方形复选框，比日期框自带的勾选框清爽得多。
+    let checkbox_class = wide("BUTTON");
+    let start_enable_text = wide("起");
+    let end_enable_text = wide("止");
+    for (id, x, text) in [
+        (FILTER_START_ENABLE_ID, 376, &start_enable_text),
+        (FILTER_END_ENABLE_ID, 638, &end_enable_text),
+    ] {
+        if let Ok(checkbox) = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            PCWSTR(checkbox_class.as_ptr()),
+            PCWSTR(text.as_ptr()),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
+            x,
+            11,
+            38,
+            20,
+            window,
+            HMENU(id as *mut c_void),
+            instance,
+            None,
+        ) {
+            if id == FILTER_START_ENABLE_ID {
+                FILTER_START_ENABLE.store(checkbox.0 as isize, Ordering::SeqCst);
+            } else {
+                FILTER_END_ENABLE.store(checkbox.0 as isize, Ordering::SeqCst);
+            }
+            SendMessageW(checkbox, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        }
+    }
+
+    // 日期时间框统一格式：年月日时分秒，方便精确到某一秒。
+    let picker_class = wide("SysDateTimePick32");
+    let picker_format = wide("yyyy-MM-dd HH:mm:ss");
+    // 不使用 DTS_SHOWNONE：时间框里不再内嵌小勾选框，是否启用由左边的复选框决定。
+    let picker_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0);
+
+    // 宽度 190：刚好容纳「2026-11-16 22:08:31」19 个字符 + 右侧下拉箭头，
+    // 小于 190 时最后的秒数会被裁掉。
+    for (id, x) in [(FILTER_START_PICKER_ID, 418), (FILTER_END_PICKER_ID, 680)] {
+        if let Ok(picker) = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            PCWSTR(picker_class.as_ptr()),
+            PCWSTR::null(),
+            picker_style,
+            x,
+            8,
+            190,
+            24,
+            window,
+            HMENU(id as *mut c_void),
+            instance,
+            None,
+        ) {
+            // 记住句柄，刷新 / 清除筛选时按句柄读写时间。
+            if id == FILTER_START_PICKER_ID {
+                FILTER_START_PICKER.store(picker.0 as isize, Ordering::SeqCst);
+            } else {
+                FILTER_END_PICKER.store(picker.0 as isize, Ordering::SeqCst);
+            }
+            SendMessageW(picker, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            SendMessageW(
+                picker,
+                DTM_SETFORMATW,
+                WPARAM(0),
+                LPARAM(picker_format.as_ptr() as isize),
+            );
+        }
+    }
+
+    // 「至」：连接起止两个时间框。
+    let to_text = wide("至");
+    if let Ok(to_label) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(label_class.as_ptr()),
+        PCWSTR(to_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE,
+        614,
+        13,
+        20,
+        20,
+        window,
+        HMENU::default(),
+        instance,
+        None,
+    ) {
+        SendMessageW(to_label, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+
+    // 「清除筛选」：去掉两个复选框的勾选，恢复显示全部记录。
+    let clear_text = wide("清除筛选");
+    let button_class = wide("BUTTON");
+    if let Ok(clear_button) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(button_class.as_ptr()),
+        PCWSTR(clear_text.as_ptr()),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        878,
+        8,
+        84,
+        24,
+        window,
+        HMENU(FILTER_CLEAR_BUTTON_ID as *mut c_void),
+        instance,
+        None,
+    ) {
+        SendMessageW(clear_button, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
     }
 
     let list_class = wide("SysListView32");
@@ -442,6 +654,9 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         );
     }
 
+    // 给列头加上当前排序方向的箭头（默认时间倒序：↓）。
+    update_sort_headers();
+
     resize_controls(window, list);
 }
 
@@ -454,14 +669,10 @@ unsafe fn resize_controls(window: HWND, list: HWND) {
     let client_width = rect.right - rect.left;
     let client_height = rect.bottom - rect.top;
 
-    // 搜索框宽度跟着窗口走，右边留 8 像素边距。
-    let edit = HWND(SEARCH_EDIT.load(Ordering::SeqCst) as *mut c_void);
-    if !edit.0.is_null() {
-        let edit_width = (client_width - 56 - 8).max(120);
-        let _ = MoveWindow(edit, 56, 8, edit_width, 24, true);
-    }
+    // 搜索框固定 240 宽，右侧同一行放时间筛选控件；
+    // 窗口变窄时只有列表宽度会被压缩，筛选控件位置保持不动。
 
-    // 列表放在搜索栏下方。
+    // 列表放在工具栏下方。
     let list_width = (client_width - 16).max(100);
     let list_height = (client_height - TOOLBAR_HEIGHT - 8).max(100);
     let _ = MoveWindow(list, 8, TOOLBAR_HEIGHT, list_width, list_height, true);
@@ -482,8 +693,10 @@ fn load_rows() -> Vec<FileOrigin> {
         }
     }
 
+    let range = time_filter_range();
     match guard.as_ref() {
-        Some(db) => db.recent(MAX_ROWS).unwrap_or_default(),
+        // 有时间筛选时只查这个时间段内的记录，没有则查全部最近记录。
+        Some(db) => db.recent_filtered(MAX_ROWS, range).unwrap_or_default(),
         None => Vec::new(),
     }
 }
@@ -601,6 +814,8 @@ fn apply_filter() {
             .collect()
     };
 
+    let mut filtered = filtered;
+    sort_rows(&mut filtered);
     fill_list(&filtered);
 }
 
@@ -623,6 +838,217 @@ fn search_text() -> String {
     let length = unsafe { GetWindowTextW(edit, &mut buffer) }.max(0) as usize;
     let length = length.min(buffer.len());
     String::from_utf16_lossy(&buffer[..length])
+}
+
+/// 读取一个复选框是否被勾选。
+fn checkbox_checked(checkbox: &AtomicIsize) -> bool {
+    let hwnd = HWND(checkbox.load(Ordering::SeqCst) as *mut c_void);
+    if hwnd.0.is_null() {
+        return false;
+    }
+    let state = unsafe { SendMessageW(hwnd, BM_GETCHECK, WPARAM(0), LPARAM(0)) }.0 as u32;
+    state == BST_CHECKED.0
+}
+
+/// 读取两个时间框，得到「起 / 止」的 Unix 秒范围。
+///
+/// - 两端复选框都没勾选：返回 `None`（不筛选）
+/// - 只勾选了一个：另一端用极小 / 极大值表示“不限”
+/// - 起止顺序反了：自动交换，避免用户手滑后列表空白
+fn time_filter_range() -> Option<(i64, i64)> {
+    let start = if checkbox_checked(&FILTER_START_ENABLE) {
+        picker_time(HWND(
+            FILTER_START_PICKER.load(Ordering::SeqCst) as *mut c_void
+        ))
+    } else {
+        None
+    };
+    let end = if checkbox_checked(&FILTER_END_ENABLE) {
+        picker_time(HWND(FILTER_END_PICKER.load(Ordering::SeqCst) as *mut c_void))
+    } else {
+        None
+    };
+
+    match (start, end) {
+        (None, None) => None,
+        (Some(start), None) => Some((start, i64::MAX)),
+        (None, Some(end)) => Some((i64::MIN, end)),
+        (Some(start), Some(end)) => Some(if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        }),
+    }
+}
+
+/// 读取一个日期时间框里的时间，转成 Unix 秒。
+///
+/// 返回 `None` 表示这个框没被勾选（DTS_SHOWNONE 的复选框是空的），也就是“不限时间”。
+fn picker_time(picker: HWND) -> Option<i64> {
+    if picker.0.is_null() {
+        return None;
+    }
+
+    let mut system_time = SYSTEMTIME::default();
+    let result = unsafe {
+        SendMessageW(
+            picker,
+            DTM_GETSYSTEMTIME,
+            WPARAM(0),
+            LPARAM(&mut system_time as *mut _ as isize),
+        )
+    }
+    .0 as isize;
+    if result != GDT_VALID {
+        return None;
+    }
+
+    // 日期时间框给的是本地时间，交给 util 换算成和数据库一致的 Unix 时间戳。
+    crate::util::local_system_time_to_unix(&system_time)
+}
+
+/// 清除时间筛选：取消两端的勾选，再重新读取全部记录。
+fn clear_time_filter() {
+    for checkbox in [&FILTER_START_ENABLE, &FILTER_END_ENABLE] {
+        let hwnd = HWND(checkbox.load(Ordering::SeqCst) as *mut c_void);
+        if !hwnd.0.is_null() {
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    BM_SETCHECK,
+                    WPARAM(BST_UNCHECKED.0 as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+    refresh_list();
+}
+
+/// 切换排序列 / 升降序。
+///
+/// 点一列：按该列排序（时间列默认最新在上，其它列默认升序）；
+/// 再点同一列：在当前方向上反转。
+fn toggle_sort(column: i32) {
+    if column < 0 {
+        return;
+    }
+    let column = column as isize;
+    if SORT_COLUMN.load(Ordering::SeqCst) == column {
+        let next = !SORT_ASCENDING.load(Ordering::SeqCst);
+        SORT_ASCENDING.store(next, Ordering::SeqCst);
+    } else {
+        SORT_COLUMN.store(column, Ordering::SeqCst);
+        // 时间列默认“最新在最上面”，文字列默认从 A 到 Z。
+        SORT_ASCENDING.store(column != 0, Ordering::SeqCst);
+    }
+    update_sort_headers();
+}
+
+/// 按当前排序状态给记录排序（时间 / 程序 / 路径 / 类型）。
+fn sort_rows(rows: &mut [FileOrigin]) {
+    let column = SORT_COLUMN.load(Ordering::SeqCst);
+    let ascending = SORT_ASCENDING.load(Ordering::SeqCst);
+
+    rows.sort_by(|a, b| {
+        let ordering = match column {
+            1 => program_column_text(a)
+                .to_lowercase()
+                .cmp(&program_column_text(b).to_lowercase()),
+            2 => a.file_path.to_lowercase().cmp(&b.file_path.to_lowercase()),
+            3 => action_label(&a.action).cmp(&action_label(&b.action)),
+            // 0 或其它：按监控时间。
+            _ => a.created_at.cmp(&b.created_at),
+        };
+        if ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        }
+    });
+}
+
+/// 在列头文字后面加上 ↑ / ↓，让用户一眼看出当前按哪列、哪个方向排序。
+fn update_sort_headers() {
+    let list = HWND(LIST_VIEW.load(Ordering::SeqCst) as *mut c_void);
+    if list.0.is_null() {
+        return;
+    }
+
+    let column = SORT_COLUMN.load(Ordering::SeqCst);
+    let ascending = SORT_ASCENDING.load(Ordering::SeqCst);
+
+    for (index, (title, _)) in COLUMNS.iter().enumerate() {
+        let text = if index as isize == column {
+            format!("{} {}", title, if ascending { "↑" } else { "↓" })
+        } else {
+            (*title).to_string()
+        };
+        let text = wide(&text);
+
+        // 只改文字，不动宽度（原有列宽保持不变）。
+        let mut column_info = LVCOLUMNW::default();
+        column_info.mask = LVCF_TEXT;
+        column_info.pszText = PWSTR(text.as_ptr() as *mut u16);
+        unsafe {
+            SendMessageW(
+                list,
+                LVM_SETCOLUMNW,
+                WPARAM(index),
+                LPARAM(&column_info as *const _ as isize),
+            );
+        }
+    }
+}
+
+/// 处理列表的 NM_CUSTOMDRAW 通知：给「类型」列的单元格刷彩色背景。
+///
+/// Windows 的 ListView 不支持直接设置某个单元格的背景色，只能通过
+/// 自定义绘制（custom draw）通知插手绘制过程，分三步：
+///
+/// 1. `CDDS_PREPAINT`（整张列表开始绘制）：返回 `CDRF_NOTIFYITEMDRAW`，
+///    告诉系统“每画一行都要再通知我一次”；
+/// 2. `CDDS_ITEMPREPAINT`（开始画某一行）：返回 `CDRF_NOTIFYSUBITEMDRAW`，
+///    要求“每个单元格也通知我”；
+/// 3. `CDDS_ITEMPREPAINT | CDDS_SUBITEM`（开始画某个单元格）：这里才能拿到
+///    具体的列号 `iSubItem`，把背景色和文字色改掉后返回 `CDRF_NEWFONT`，
+///    系统就会用我们给的颜色继续绘制这一格。
+///
+/// 其它阶段一律返回 `CDRF_DODEFAULT`，交还给系统按默认方式绘制。
+unsafe fn handle_custom_draw(lparam: LPARAM) -> LRESULT {
+    let custom = &mut *(lparam.0 as *mut NMLVCUSTOMDRAW);
+    let stage = custom.nmcd.dwDrawStage.0;
+
+    // 第一步：整表开始绘制，要求逐行通知。
+    if stage == CDDS_PREPAINT.0 {
+        return LRESULT(CDRF_NOTIFYITEMDRAW as isize);
+    }
+
+    // 第二步：某一行开始绘制，要求逐单元格通知。
+    if stage == CDDS_ITEMPREPAINT.0 {
+        return LRESULT(CDRF_NOTIFYSUBITEMDRAW as isize);
+    }
+
+    // 第三步：某个单元格开始绘制（CDDS_ITEMPREPAINT 已经包含 CDDS_ITEM 位，
+    // 与 CDDS_SUBITEM 相或后才是“单元格”阶段）。
+    if stage == (CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0) && custom.iSubItem == TYPE_COLUMN {
+        // dwItemSpec 就是行号；行号与 ROW_CACHE 一一对应（fill_list 按同样顺序缓存）。
+        let action = ROW_CACHE
+            .lock()
+            .ok()
+            .and_then(|cache| {
+                cache
+                    .get(custom.nmcd.dwItemSpec)
+                    .map(|row| row.action.clone())
+            })
+            .unwrap_or_default();
+
+        custom.clrTextBk = type_cell_color(&action);
+        custom.clrText = TYPE_CELL_TEXT_COLOR;
+        return LRESULT(CDRF_NEWFONT as isize);
+    }
+
+    LRESULT(CDRF_DODEFAULT as isize)
 }
 
 /// 把给定记录填入列表，并同步行缓存（双击 / 右键要靠它按行号找回记录）。
@@ -933,6 +1359,62 @@ pub fn run_message_loop() {
 #[cfg(test)]
 mod tests {
     use super::column_at_x;
+    use super::{program_column_text, sort_rows, FileOrigin, SORT_ASCENDING, SORT_COLUMN};
+    use std::sync::atomic::Ordering;
+
+    fn test_row(path: &str, program: &str, created_at: i64) -> FileOrigin {
+        FileOrigin {
+            file_path: path.to_string(),
+            process_name: program.to_string(),
+            process_path: program.to_string(),
+            created_at,
+            action: "create_file".to_string(),
+            note: String::new(),
+        }
+    }
+
+    /// 验证排序：按路径升序 / 降序，以及按时间升降序。
+    ///
+    /// 排序状态存在全局静态变量里，测试里显式设置并在结束时还原，
+    /// 避免影响其它依赖默认排序的测试。
+    #[test]
+    fn sort_rows_orders_by_selected_column() {
+        let mut rows = vec![
+            test_row(r"C:\b\b.txt", "m.exe", 2),
+            test_row(r"C:\a\a.txt", "Zeta.exe", 3),
+            test_row(r"C:\c\c.txt", "alpha.exe", 1),
+        ];
+
+        // 路径升序：a < b < c
+        SORT_COLUMN.store(2, Ordering::SeqCst);
+        SORT_ASCENDING.store(true, Ordering::SeqCst);
+        sort_rows(&mut rows);
+        assert_eq!(rows[0].file_path, r"C:\a\a.txt");
+        assert_eq!(rows[2].file_path, r"C:\c\c.txt");
+
+        // 路径降序
+        SORT_ASCENDING.store(false, Ordering::SeqCst);
+        sort_rows(&mut rows);
+        assert_eq!(rows[0].file_path, r"C:\c\c.txt");
+
+        // 程序名升序（忽略大小写：alpha < m < Zeta）
+        SORT_COLUMN.store(1, Ordering::SeqCst);
+        SORT_ASCENDING.store(true, Ordering::SeqCst);
+        sort_rows(&mut rows);
+        assert_eq!(program_column_text(&rows[0]), "alpha.exe");
+        assert_eq!(program_column_text(&rows[2]), "Zeta.exe");
+
+        // 时间升序
+        SORT_COLUMN.store(0, Ordering::SeqCst);
+        SORT_ASCENDING.store(true, Ordering::SeqCst);
+        sort_rows(&mut rows);
+        assert_eq!(rows[0].created_at, 1);
+
+        // 还原默认：时间倒序
+        SORT_ASCENDING.store(false, Ordering::SeqCst);
+        sort_rows(&mut rows);
+        assert_eq!(rows[0].created_at, 3);
+    }
 
     /// 验证“光标 x 坐标 -> 列下标”的换算与列宽严格一致。
     /// 这直接决定双击“创建程序 / 路径”列时能否打开对应目录。
