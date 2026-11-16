@@ -36,13 +36,14 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetClientRect,
-    GetCursorPos, GetMessageW, GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MoveWindow,
-    PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer, ShowWindow,
-    TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL,
-    IDC_ARROW, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL, TPM_LEFTALIGN,
-    TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_NOTIFY, WM_NULL, WM_SETFONT, WM_SETICON,
-    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    GetCursorPos, GetMessageW, GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MessageBoxW,
+    MoveWindow, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
+    ShowWindow, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG,
+    ICON_SMALL, IDC_ARROW, MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG,
+    SW_HIDE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE,
+    WINDOW_EX_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT,
+    WM_CTLCOLORSTATIC, WM_NOTIFY, WM_NULL, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSEXW,
+    WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::db::{Database, FileOrigin};
@@ -98,6 +99,8 @@ const MENU_OPEN_PATH: u32 = 4001;
 const MENU_COPY_ENTRY: u32 = 4002;
 const MENU_OPEN_PROGRAM_DIR: u32 = 4003;
 const MENU_SET_NOTE: u32 = 4004;
+/// 把这条记录里的「创建程序」加入当前黑/白名单。
+const MENU_ADD_TO_LIST: u32 = 4005;
 
 /// 剪贴板文本格式（CF_UNICODETEXT）。
 const CF_UNICODETEXT: u32 = 13;
@@ -241,6 +244,11 @@ unsafe extern "system" fn window_procedure(
                 MENU_SET_NOTE => {
                     if let Some(row) = context_row() {
                         edit_program_note(&row);
+                    }
+                }
+                MENU_ADD_TO_LIST => {
+                    if let Some(row) = context_row() {
+                        add_program_to_list(&row);
                     }
                 }
                 _ => {}
@@ -687,11 +695,12 @@ unsafe fn show_row_menu(window: HWND, index: usize) {
         return;
     };
 
-    let items: [(u32, &str); 4] = [
+    let items: [(u32, &str); 5] = [
         (MENU_OPEN_PATH, "打开文件路径"),
         (MENU_COPY_ENTRY, "复制词条"),
         (MENU_OPEN_PROGRAM_DIR, "打开创建程序所在目录"),
         (MENU_SET_NOTE, "设置程序备注…"),
+        (MENU_ADD_TO_LIST, menu_add_to_list_text()),
     ];
 
     for (position, (command, text)) in items.iter().enumerate() {
@@ -704,7 +713,7 @@ unsafe fn show_row_menu(window: HWND, index: usize) {
             PCWSTR(text.as_ptr()),
         );
     }
-    // 前两项是“对这条记录本身的操作”，后两项针对创建者程序，用分隔线隔开。
+    // 前两项是“对这条记录本身的操作”，后面几项针对创建者程序，用分隔线隔开。
     let _ = InsertMenuW(menu, 2, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
 
     let mut point = POINT::default();
@@ -736,6 +745,61 @@ fn context_row() -> Option<FileOrigin> {
         return None;
     }
     cached_row(index as usize)
+}
+
+/// 右键菜单里「加入名单」这一项的显示文字。
+///
+/// 名称随设置里的模式变化，用户不用打开设置也能知道会加进哪个名单。
+fn menu_add_to_list_text() -> &'static str {
+    match crate::config::Config::load_or_default() {
+        Ok(config) if config.is_white_list() => "加入白名单（此程序）",
+        _ => "加入黑名单（此程序）",
+    }
+}
+
+/// 把当前记录的「创建程序」加入黑/白名单。
+///
+/// 加入黑名单后，这个程序以后再创建/修改文件都不会被记录；
+/// 加入白名单后，则只有这个程序的操作会被记录（白名单模式下）。
+fn add_program_to_list(row: &FileOrigin) {
+    let config = match crate::config::Config::load_or_default() {
+        Ok(config) => config,
+        Err(error) => {
+            log::error!("[名单] 读取配置失败：{:#}", error);
+            return;
+        }
+    };
+
+    let result = crate::config::Config::default_data_dir()
+        .map_err(|error| anyhow::anyhow!("{:#}", error))
+        .and_then(|data_dir| Database::init(&data_dir))
+        .and_then(|db| db.add_list_entry(&config.list_mode, &row.process_path, false));
+
+    let window = HWND(HISTORY_WINDOW.load(Ordering::SeqCst) as *mut c_void);
+    match result {
+        Ok(()) => {
+            log::info!(
+                "[名单] 已把 {} 加入{}",
+                row.process_path,
+                config.list_mode_name()
+            );
+            let text = wide(&format!(
+                "已把下面这个程序加入{}：\n\n{}\n\n名单可以在托盘菜单的「名单管理」里查看和移除。",
+                config.list_mode_name(),
+                row.process_path
+            ));
+            let title = wide("文件来源追踪");
+            unsafe {
+                let _ = MessageBoxW(
+                    window,
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+        }
+        Err(error) => log::error!("[名单] 加入名单失败：{:#}", error),
+    }
 }
 
 /// 打开备注编辑窗口，并把用户输入的备注保存到数据库。

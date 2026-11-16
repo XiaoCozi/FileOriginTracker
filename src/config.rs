@@ -39,6 +39,16 @@ pub struct Config {
     /// 写入事件数量非常大，所以默认关闭，需要用户在设置里主动开启。
     #[serde(default)]
     pub monitor_modify_file: bool,
+    /// 黑白名单模式：`black` 表示黑名单，`white` 表示白名单。
+    ///
+    /// 名单具体条目存在数据库的 `list_entries` 表里，配置文件只保存当前模式。
+    #[serde(default = "default_list_mode")]
+    pub list_mode: String,
+}
+
+/// 默认使用黑名单模式（名单为空时等价于“记录所有文件”）。
+fn default_list_mode() -> String {
+    crate::list_rules::MODE_BLACK.to_string()
 }
 
 /// 默认保留 7 天。
@@ -90,6 +100,7 @@ impl Config {
             monitor_create_file: true,
             monitor_create_dir: true,
             monitor_modify_file: false,
+            list_mode: default_list_mode(),
         };
         config.save()?;
         Ok(config)
@@ -99,6 +110,20 @@ impl Config {
     /// 全部关闭时完全停止 ETW 会话，避免空转占用 CPU。
     pub fn any_monitor_enabled(&self) -> bool {
         self.monitor_create_file || self.monitor_create_dir || self.monitor_modify_file
+    }
+
+    /// 当前是否为白名单模式（配置里出现无法识别的值时一律按黑名单处理）。
+    pub fn is_white_list(&self) -> bool {
+        self.list_mode == crate::list_rules::MODE_WHITE
+    }
+
+    /// 当前模式的名称，用于界面与日志显示。
+    pub fn list_mode_name(&self) -> &'static str {
+        if self.is_white_list() {
+            "白名单"
+        } else {
+            "黑名单"
+        }
     }
 
     /// 返回数据库实际使用的目录。

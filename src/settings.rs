@@ -26,11 +26,11 @@ use windows::Win32::System::Registry::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetWindowTextW, LoadCursorW, MessageBoxW, RegisterClassExW,
     SendMessageW, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
-    BS_GROUPBOX, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_NUMBER, HMENU, ICON_BIG,
-    ICON_SMALL, IDC_ARROW, MB_ICONWARNING, MB_OK, SW_HIDE, SW_SHOWNORMAL, WA_INACTIVE,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
-    WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_SETICON, WNDCLASSEXW, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    BS_AUTORADIOBUTTON, BS_GROUPBOX, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_NUMBER,
+    HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW, MB_ICONWARNING, MB_OK, SW_HIDE, SW_SHOWNORMAL,
+    WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE,
+    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_SETICON, WNDCLASSEXW, WS_CHILD,
+    WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::config::Config;
@@ -54,6 +54,11 @@ const ID_MONITOR_MODIFY_CHECK: usize = 2007;
 /// 注册 / 注销资源管理器右键菜单（从托盘菜单移到这里）。
 const ID_REGISTER_SHELL_BUTTON: usize = 2008;
 const ID_UNREGISTER_SHELL_BUTTON: usize = 2009;
+/// 黑白名单模式：黑名单 / 白名单单选框。
+const ID_BLACKLIST_RADIO: usize = 2010;
+const ID_WHITELIST_RADIO: usize = 2011;
+/// 打开名单管理窗口。
+const ID_MANAGE_LIST_BUTTON: usize = 2012;
 
 /// 开机自启使用的注册表位置：当前用户登录时自动运行。
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -90,7 +95,7 @@ pub fn show() -> Result<()> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             560,
-            528,
+            618,
             HWND::default(),
             HMENU::default(),
             instance,
@@ -158,6 +163,12 @@ unsafe extern "system" fn window_procedure(
                 }
                 ID_UNREGISTER_SHELL_BUTTON => {
                     unregister_shell_menu(hwnd);
+                    LRESULT(0)
+                }
+                ID_MANAGE_LIST_BUTTON => {
+                    if let Err(error) = crate::list_window::show() {
+                        log::error!("打开名单管理窗口失败：{:#}", error);
+                    }
                     LRESULT(0)
                 }
                 _ => DefWindowProcW(hwnd, message, wparam, lparam),
@@ -369,8 +380,73 @@ unsafe fn create_controls(window: HWND) {
         font,
     );
 
-    // ---- 分组 4：资源管理器右键菜单 ----
-    create_group(window, "资源管理器右键菜单", 16, 336, 512, 88, font);
+    // ---- 分组 4：名单模式 ----
+    create_group(window, "黑白名单模式", 16, 336, 512, 80, font);
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "黑名单",
+            WINDOW_STYLE(
+                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32 | 0x8, // WS_GROUP
+            ),
+            34,
+            352,
+            80,
+            24,
+            window,
+            ID_BLACKLIST_RADIO,
+        ),
+        font,
+    );
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "白名单",
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32),
+            120,
+            352,
+            80,
+            24,
+            window,
+            ID_WHITELIST_RADIO,
+        ),
+        font,
+    );
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "STATIC",
+            "黑名单：不记录名单里的程序 / 文件夹\n白名单：只记录名单里的程序 / 文件夹",
+            label_style,
+            34,
+            376,
+            350,
+            36,
+            window,
+            0,
+        ),
+        font,
+    );
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "管理名单…",
+            button_style,
+            400,
+            376,
+            110,
+            30,
+            window,
+            ID_MANAGE_LIST_BUTTON,
+        ),
+        font,
+    );
+
+    // ---- 分组 5：资源管理器右键菜单 ----
+    create_group(window, "资源管理器右键菜单", 16, 424, 512, 88, font);
     set_font(
         create_control(
             WINDOW_EX_STYLE::default(),
@@ -378,7 +454,7 @@ unsafe fn create_controls(window: HWND) {
             "注册后可以在文件 / 文件夹上右键，查看它的创建来源。",
             label_style,
             34,
-            356,
+            444,
             470,
             20,
             window,
@@ -393,7 +469,7 @@ unsafe fn create_controls(window: HWND) {
             "注册右键菜单",
             button_style,
             34,
-            382,
+            470,
             120,
             30,
             window,
@@ -408,7 +484,7 @@ unsafe fn create_controls(window: HWND) {
             "注销右键菜单",
             button_style,
             170,
-            382,
+            470,
             120,
             30,
             window,
@@ -425,7 +501,7 @@ unsafe fn create_controls(window: HWND) {
             "保存",
             button_style,
             316,
-            440,
+            528,
             100,
             32,
             window,
@@ -440,7 +516,7 @@ unsafe fn create_controls(window: HWND) {
             "关闭",
             button_style,
             428,
-            440,
+            528,
             100,
             32,
             window,
@@ -570,6 +646,21 @@ fn load_values(window: HWND) {
             WPARAM(if config.monitor_modify_file { 1 } else { 0 }),
             LPARAM(0),
         );
+
+        // 黑白名单模式：两个单选框只能有一个选中。
+        let white = config.is_white_list();
+        SendMessageW(
+            child(window, ID_BLACKLIST_RADIO),
+            BM_SETCHECK,
+            WPARAM(if white { 0 } else { 1 }),
+            LPARAM(0),
+        );
+        SendMessageW(
+            child(window, ID_WHITELIST_RADIO),
+            BM_SETCHECK,
+            WPARAM(if white { 1 } else { 0 }),
+            LPARAM(0),
+        );
     }
 }
 
@@ -588,14 +679,21 @@ fn save_and_apply(window: HWND) {
     let monitor_file = read_check(window, ID_MONITOR_FILE_CHECK);
     let monitor_dir = read_check(window, ID_MONITOR_DIR_CHECK);
     let monitor_modify = read_check(window, ID_MONITOR_MODIFY_CHECK);
+    // 白名单单选框被选中就是白名单模式，否则黑名单。
+    let list_mode = if read_check(window, ID_WHITELIST_RADIO) {
+        crate::list_rules::MODE_WHITE
+    } else {
+        crate::list_rules::MODE_BLACK
+    };
     log::info!(
-        "[设置] 保存：保留天数文本={:?} 天数={} 开机自启={} 监控（创建文件={} 创建文件夹={} 修改文件={}）",
+        "[设置] 保存：保留天数文本={:?} 天数={} 开机自启={} 监控（创建文件={} 创建文件夹={} 修改文件={}）名单模式={}",
         days_text,
         days,
         autostart,
         monitor_file,
         monitor_dir,
-        monitor_modify
+        monitor_modify,
+        list_mode
     );
 
     let mut config = match Config::load_or_default() {
@@ -609,6 +707,7 @@ fn save_and_apply(window: HWND) {
     config.monitor_create_file = monitor_file;
     config.monitor_create_dir = monitor_dir;
     config.monitor_modify_file = monitor_modify;
+    config.list_mode = list_mode.to_string();
 
     if let Err(error) = config.save() {
         show_warning(&format!("保存配置失败：{:#}", error));
@@ -644,11 +743,24 @@ fn save_and_apply(window: HWND) {
         Err(error) => log::warn!("打开数据库失败：{:#}", error),
     }
 
+    // 白名单为空时不会记录任何文件，这里额外提醒一次，避免用户以为程序坏了。
+    let white_list_empty = config.is_white_list()
+        && Database::init(&config.data_dir)
+            .and_then(|db| db.list_entries(crate::list_rules::MODE_WHITE))
+            .map(|entries| entries.is_empty())
+            .unwrap_or(false);
+
+    let message = if white_list_empty {
+        "设置已保存并立即生效。\n\n注意：当前是白名单模式，但白名单还是空的，\n所以现在不会记录任何文件。\n请点「管理名单…」添加程序或文件夹。"
+    } else {
+        "设置已保存并立即生效。"
+    };
+
     unsafe {
         // 以设置窗口为所有者，消息框不会跑到窗口后面。
         let _ = MessageBoxW(
             window,
-            PCWSTR(wide("设置已保存并立即生效。").as_ptr()),
+            PCWSTR(wide(message).as_ptr()),
             PCWSTR(wide("文件来源追踪").as_ptr()),
             MB_OK,
         );

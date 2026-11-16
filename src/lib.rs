@@ -11,6 +11,8 @@ pub mod config;
 pub mod db;
 pub mod etw;
 pub mod history;
+pub mod list_rules;
+pub mod list_window;
 pub mod note;
 pub mod process;
 pub mod settings;

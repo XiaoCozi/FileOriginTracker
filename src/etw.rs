@@ -692,7 +692,21 @@ fn process_events(receiver: Receiver<FileEvent>, db: Database, config: Config) {
     let drive_mappings = query_drive_mappings();
     let mut process_cache: HashMap<u32, (String, String)> = HashMap::new();
 
+    // 黑白名单规则的内存快照。写库线程周期性重新加载，
+    // 用户在「名单管理」里改完名单后 2 秒内自动生效，不用重启程序。
+    let mut rules = crate::list_rules::ListRules::load(&db, &config.list_mode);
+    if rules.is_empty() && rules.is_white_mode() {
+        warn!(
+            "[名单] 当前是白名单模式但名单为空：不会记录任何文件，请先在名单管理里添加程序或文件夹"
+        );
+    }
+
     for event in receiver {
+        // 刷新名单（最多每 2 秒查一次数据库，避免拖慢高频事件处理）。
+        if rules.needs_reload() {
+            rules = crate::list_rules::ListRules::load(&db, &config.list_mode);
+        }
+
         let file_path = normalize_device_path(&event.file_path, &drive_mappings);
         if file_path.is_empty() || config.should_ignore(Path::new(&file_path)) {
             continue;
@@ -749,6 +763,12 @@ fn process_events(receiver: Receiver<FileEvent>, db: Database, config: Config) {
         let Some((process_name, process_path)) = process else {
             continue;
         };
+
+        // 黑白名单过滤：黑名单里命中的程序/文件夹不记录，
+        // 白名单模式则只有命中的才记录。
+        if !rules.allows(&file_path, &process_path) {
+            continue;
+        }
 
         let result = match event.action {
             FileAction::Create => {

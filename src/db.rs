@@ -91,6 +91,16 @@ impl Database {
                 note         TEXT NOT NULL,
                 updated_at   INTEGER NOT NULL
             );
+
+            -- 黑白名单：mode 区分黑名单(black)和白名单(white)，
+            -- kind 区分程序(program)和文件夹(folder)，同一条目只存一份。
+            CREATE TABLE IF NOT EXISTS list_entries (
+                mode     TEXT NOT NULL,
+                path     TEXT NOT NULL,
+                kind     TEXT NOT NULL,
+                added_at INTEGER NOT NULL,
+                PRIMARY KEY (mode, path)
+            );
             "#,
         )?;
 
@@ -356,6 +366,114 @@ impl Database {
             .unwrap_or_default();
         Ok(note)
     }
+
+    /// 读取某个模式（black / white）下的全部名单条目。
+    pub fn list_entries(&self, mode: &str) -> Result<Vec<ListEntry>> {
+        let conn = self.lock_connection();
+        let mut stmt = conn.prepare(
+            "SELECT path, kind FROM list_entries WHERE mode = ?1 ORDER BY kind, path COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![mode], |row| {
+            let kind: String = row.get(1)?;
+            Ok(ListEntry {
+                path: row.get(0)?,
+                is_folder: kind == LIST_KIND_FOLDER,
+            })
+        })?;
+
+        let mut entries = Vec::new();
+        for entry in rows {
+            entries.push(entry?);
+        }
+        Ok(entries)
+    }
+
+    /// 读取黑名单 + 白名单的全部条目，供「名单管理」窗口一起展示。
+    ///
+    /// 返回 `(模式, 条目)`：模式用来在列表里显示「黑名单 / 白名单」，
+    /// 移除时也能知道该从哪个名单里删。
+    pub fn all_list_entries(&self) -> Result<Vec<(String, ListEntry)>> {
+        let conn = self.lock_connection();
+        let mut stmt = conn.prepare(
+            "SELECT mode, path, kind FROM list_entries
+             ORDER BY mode, kind, path COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let kind: String = row.get(2)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                ListEntry {
+                    path: row.get(1)?,
+                    is_folder: kind == LIST_KIND_FOLDER,
+                },
+            ))
+        })?;
+
+        let mut entries = Vec::new();
+        for entry in rows {
+            entries.push(entry?);
+        }
+        Ok(entries)
+    }
+
+    /// 向名单里添加一条（程序或文件夹）。
+    ///
+    /// 同一条目重复添加时直接忽略，不会报错，界面上也不会出现两条一样的记录。
+    pub fn add_list_entry(&self, mode: &str, path: &str, is_folder: bool) -> Result<()> {
+        let conn = self.lock_connection();
+        let kind = if is_folder {
+            LIST_KIND_FOLDER
+        } else {
+            LIST_KIND_PROGRAM
+        };
+        conn.execute(
+            "INSERT OR IGNORE INTO list_entries(mode, path, kind, added_at)
+             VALUES(?1, ?2, ?3, ?4)",
+            params![mode, path, kind, chrono_now()],
+        )?;
+        Ok(())
+    }
+
+    /// 从名单里移除一条。
+    pub fn remove_list_entry(&self, mode: &str, path: &str) -> Result<()> {
+        let conn = self.lock_connection();
+        conn.execute(
+            "DELETE FROM list_entries WHERE mode = ?1 AND path = ?2",
+            params![mode, path],
+        )?;
+        Ok(())
+    }
+
+    /// 把一条名单条目切换到另一个名单（黑名单 ↔ 白名单）。
+    ///
+    /// 表的主键是 (mode, path)，所以只要把 mode 改掉就行。
+    /// 但如果目标名单里已经有同一个路径，直接改会撞主键，
+    /// 这里用 `UPDATE OR REPLACE`：先删掉目标名单里的旧行，再写入新行。
+    pub fn move_list_entry(&self, from_mode: &str, path: &str, to_mode: &str) -> Result<()> {
+        let conn = self.lock_connection();
+        conn.execute(
+            "UPDATE OR REPLACE list_entries
+             SET mode = ?1, added_at = ?2
+             WHERE mode = ?3 AND path = ?4",
+            params![to_mode, chrono_now(), from_mode, path],
+        )?;
+        Ok(())
+    }
+}
+
+/// 名单条目的类型：程序。
+pub const LIST_KIND_PROGRAM: &str = "program";
+/// 名单条目的类型：文件夹。
+pub const LIST_KIND_FOLDER: &str = "folder";
+
+/// 黑白名单里的一条记录。
+#[derive(Debug, Clone)]
+pub struct ListEntry {
+    /// 程序完整路径，或文件夹路径。
+    pub path: String,
+    /// true 表示这是文件夹条目（按目录前缀匹配），
+    /// false 表示这是程序条目（按程序完整路径精确匹配）。
+    pub is_folder: bool,
 }
 
 /// 获取当前 Unix 时间戳（秒）
@@ -371,6 +489,37 @@ fn chrono_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::list_rules::{MODE_BLACK, MODE_WHITE};
+
+    /// 验证名单条目能在黑名单 / 白名单之间来回切换，
+    /// 以及目标名单里已有同一路径时不会因主键冲突失败。
+    #[test]
+    fn list_entry_moves_between_lists() {
+        let dir = std::env::temp_dir().join("file_origin_tracker_db_test_move");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Database::init(&dir).unwrap();
+
+        // 先加一条黑名单程序，再切到白名单。
+        db.add_list_entry(MODE_BLACK, r"C:\tool.exe", false)
+            .unwrap();
+        assert_eq!(db.list_entries(MODE_BLACK).unwrap().len(), 1);
+
+        db.move_list_entry(MODE_BLACK, r"C:\tool.exe", MODE_WHITE)
+            .unwrap();
+        assert_eq!(db.list_entries(MODE_BLACK).unwrap().len(), 0);
+        let white = db.list_entries(MODE_WHITE).unwrap();
+        assert_eq!(white.len(), 1);
+        assert_eq!(white[0].path, r"C:\tool.exe");
+        assert!(!white[0].is_folder);
+
+        // 两个名单里都存在同一路径时，切换应覆盖而不是报主键冲突。
+        db.add_list_entry(MODE_WHITE, r"C:\dir", true).unwrap();
+        db.add_list_entry(MODE_BLACK, r"C:\dir", true).unwrap();
+        db.move_list_entry(MODE_BLACK, r"C:\dir", MODE_WHITE)
+            .unwrap();
+        assert_eq!(db.list_entries(MODE_BLACK).unwrap().len(), 0);
+        assert_eq!(db.list_entries(MODE_WHITE).unwrap().len(), 2);
+    }
 
     /// 验证“按保留天数清理 + 压缩”能删掉过期记录、保留新记录。
     #[test]
