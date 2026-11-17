@@ -41,6 +41,9 @@ const WINDOW_TITLE: &str = "文件来源追踪 - 设置";
 const WINDOW_CLASS: &str = "FileOriginTrackerSettingsWindow";
 
 /// 控件 ID。窗口过程通过它们区分是哪一个控件发来的通知。
+///
+/// 注意：这里的每个 ID 都必须全局唯一。如果两个控件用了同一个 ID，
+/// `WM_COMMAND` 无法区分是谁发的通知，会出现「点 A 控件却触发 B 功能」的怪现象。
 const ID_RETENTION_EDIT: usize = 2001;
 const ID_AUTOSTART_CHECK: usize = 2002;
 /// 监控开关：新建文件。
@@ -52,8 +55,12 @@ const ID_MONITOR_DIR_CHECK: usize = 2006;
 /// 监控开关：修改文件。
 const ID_MONITOR_MODIFY_CHECK: usize = 2007;
 /// 监控开关：删除文件 / 删除文件夹。
-const ID_MONITOR_DELETE_FILE_CHECK: usize = 2011;
-const ID_MONITOR_DELETE_DIR_CHECK: usize = 2012;
+///
+/// 这里使用 2013 / 2014，是因为 2011、2012 已经被下面的
+/// 「白名单单选」和「名单管理按钮」占用。早期版本误用了重复 ID，
+/// 导致点击这两个复选框会触发别的按钮功能。
+const ID_MONITOR_DELETE_FILE_CHECK: usize = 2013;
+const ID_MONITOR_DELETE_DIR_CHECK: usize = 2014;
 /// 注册 / 注销资源管理器右键菜单（从托盘菜单移到这里）。
 const ID_REGISTER_SHELL_BUTTON: usize = 2008;
 const ID_UNREGISTER_SHELL_BUTTON: usize = 2009;
