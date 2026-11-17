@@ -17,5 +17,6 @@ pub mod note;
 pub mod process;
 pub mod settings;
 pub mod shell_menu;
+pub mod stats;
 pub mod tray;
 pub mod util;

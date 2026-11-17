@@ -31,6 +31,8 @@ const WM_TRAY_ICON: u32 = WM_USER + 100;
 const MENU_SHOW_HISTORY: u32 = 1001;
 const MENU_OPEN_DATA_DIR: u32 = 1002;
 const MENU_LIST_MANAGER: u32 = 1003;
+/// 打开「程序统计」窗口：按程序汇总各类事件的数量。
+const MENU_STATS: u32 = 1004;
 const MENU_RESTART_AS_ADMIN: u32 = 1005;
 const MENU_SETTINGS: u32 = 1006;
 const MENU_QUIT: u32 = 9999;
@@ -171,6 +173,11 @@ unsafe extern "system" fn window_procedure(
                     }
                 }
                 MENU_OPEN_DATA_DIR => open_data_dir(),
+                MENU_STATS => {
+                    if let Err(error) = crate::stats::show() {
+                        log::error!("打开程序统计窗口失败：{:#}", error);
+                    }
+                }
                 MENU_LIST_MANAGER => {
                     if let Err(error) = crate::list_window::show() {
                         log::error!("打开名单管理窗口失败：{:#}", error);
@@ -200,6 +207,7 @@ unsafe fn show_tray_menu(hwnd: HWND) -> Result<()> {
     let menu = CreatePopupMenu()?;
     let items = [
         (MENU_SHOW_HISTORY, "查看最近记录"),
+        (MENU_STATS, "程序统计"),
         (MENU_LIST_MANAGER, "名单管理（黑/白名单）"),
         (MENU_OPEN_DATA_DIR, "打开数据目录"),
         (MENU_SETTINGS, "设置"),

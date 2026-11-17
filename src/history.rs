@@ -126,6 +126,8 @@ const FILTER_CLEAR_BUTTON_ID: usize = 5;
 /// 所以改用独立的复选框：勾上才按该端时间筛选，不勾表示这一端不限。
 const FILTER_START_ENABLE_ID: usize = 6;
 const FILTER_END_ENABLE_ID: usize = 7;
+/// 顶部工具栏右侧的「程序统计」按钮。
+const STATS_BUTTON_ID: usize = 8;
 
 /// 日期时间框的值变化通知码（winuser.h 里的 DTN_DATETIMECHANGE = 0U-759U）。
 const DTN_DATETIMECHANGE_CODE: u32 = 0xFFFF_FD09;
@@ -296,6 +298,12 @@ unsafe extern "system" fn window_procedure(
             let id = (wparam.0 & 0xFFFF) as u32;
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             match id {
+                // 「程序统计」按钮：打开按程序汇总的统计窗口。
+                _ if id == STATS_BUTTON_ID as u32 => {
+                    if let Err(error) = crate::stats::show() {
+                        log::error!("打开程序统计窗口失败：{:#}", error);
+                    }
+                }
                 // 搜索框内容变化：立刻按关键字重新过滤列表。
                 _ if id == SEARCH_CONTROL_ID as u32 && code == EN_CHANGE_CODE => {
                     apply_filter(false);
@@ -476,6 +484,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     }
 
     // 搜索框：用户输入时通过 WM_COMMAND(EN_CHANGE) 通知窗口，实时过滤列表。
+    // 宽度 160：比原来缩短，给右边的「程序统计」按钮腾出位置。
     let edit_class = wide("EDIT");
     if let Ok(edit) = CreateWindowExW(
         WINDOW_EX_STYLE(0x0000_0200), // WS_EX_CLIENTEDGE：输入框加立体边框
@@ -486,7 +495,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
             | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(ES_AUTOHSCROLL as u32),
         56,
         8,
-        240,
+        160,
         24,
         window,
         HMENU(SEARCH_CONTROL_ID as *mut std::ffi::c_void),
@@ -495,6 +504,27 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     ) {
         SEARCH_EDIT.store(edit.0 as isize, Ordering::SeqCst);
         SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+
+    // 搜索框右侧的「程序统计」入口：打开按程序汇总的统计窗口。
+    // 和托盘菜单里的「程序统计」是同一个窗口，这里只是多一个更顺手的入口。
+    let stats_class = wide("BUTTON");
+    let stats_text = wide("程序统计");
+    if let Ok(stats_button) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(stats_class.as_ptr()),
+        PCWSTR(stats_text.as_ptr()),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        222,
+        8,
+        84,
+        24,
+        window,
+        HMENU(STATS_BUTTON_ID as *mut c_void),
+        instance,
+        None,
+    ) {
+        SendMessageW(stats_button, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
     }
 
     // ===== 同一行的右侧：时间筛选 =====
@@ -689,8 +719,8 @@ unsafe fn resize_controls(window: HWND, list: HWND) {
     let client_width = rect.right - rect.left;
     let client_height = rect.bottom - rect.top;
 
-    // 搜索框固定 240 宽，右侧同一行放时间筛选控件；
-    // 窗口变窄时只有列表宽度会被压缩，筛选控件位置保持不动。
+    // 搜索框固定 160 宽，右侧依次是「程序统计」按钮和时间筛选控件；
+    // 窗口变窄时只有列表宽度会被压缩，顶部控件位置保持不动。
 
     // 列表放在工具栏下方。
     let list_width = (client_width - 16).max(100);

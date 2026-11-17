@@ -39,6 +39,52 @@ pub struct FileOrigin {
     pub note: String,
 }
 
+/// 按「程序」汇总的统计结果，供「程序统计」窗口使用。
+///
+/// 分组依据是程序完整路径：同名的两个程序（例如装在两个目录里的 app.exe）
+/// 各自算一行，避免把不同软件的数字混在一起。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProgramStat {
+    /// 进程名，例如 "explorer.exe"
+    pub process_name: String,
+    /// 进程完整路径，同时作为统计的分组键
+    pub process_path: String,
+    /// 用户给这个程序写的备注（没有时为空字符串）
+    pub note: String,
+    /// 创建文件的次数
+    pub create_file: i64,
+    /// 创建文件夹的次数
+    pub create_dir: i64,
+    /// 修改文件的次数
+    pub modify: i64,
+    /// 删除文件的次数
+    pub delete_file: i64,
+    /// 删除文件夹的次数
+    pub delete_dir: i64,
+}
+
+impl ProgramStat {
+    /// 五类事件的总数。
+    pub fn total(&self) -> i64 {
+        self.create_file + self.create_dir + self.modify + self.delete_file + self.delete_dir
+    }
+
+    /// 按动作名取对应的计数。
+    ///
+    /// 统计窗口的「创建文件」到「删除文件夹」五列都通过它取数，
+    /// 避免在界面代码里写一大串 match。
+    pub fn count_of(&self, action: &str) -> i64 {
+        match action {
+            "create_file" => self.create_file,
+            "create_dir" => self.create_dir,
+            "modify" => self.modify,
+            "delete_file" => self.delete_file,
+            "delete_dir" => self.delete_dir,
+            _ => 0,
+        }
+    }
+}
+
 impl Database {
     /// 初始化数据库（创建连接 + 建表）
     pub fn init(data_dir: &Path) -> Result<Self> {
@@ -54,6 +100,9 @@ impl Database {
         // WAL 模式让读取和写入可以并发，性能更好
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        // 主程序写库和界面删除记录可能同时发生。设置 3 秒的锁等待，
+        // 避免偶发的同时写入直接报 “database is locked”。
+        conn.execute_batch("PRAGMA busy_timeout=3000;")?;
 
         // 创建表结构
         conn.execute_batch(
@@ -376,6 +425,241 @@ impl Database {
             result.push(row?);
         }
         Ok(result)
+    }
+
+    /// 按程序汇总五类事件的数量，供「程序统计」窗口使用。
+    ///
+    /// 做法是先把三张表 UNION 成一张统一视图（每行带 `action`），
+    /// 再按 `process_path` 分组，用五个 `SUM(CASE WHEN ...)` 分别统计每类次数。
+    /// 排序交给界面层处理（用户点哪列就按哪列排）。
+    pub fn program_stats(&self) -> Result<Vec<ProgramStat>> {
+        let conn = self.lock_connection();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT MAX(t.process_name),
+                   t.process_path,
+                   COALESCE(n.note, ''),
+                   SUM(CASE WHEN t.action = 'create_file' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN t.action = 'create_dir'  THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN t.action = 'modify'      THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN t.action = 'delete_file' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN t.action = 'delete_dir'  THEN 1 ELSE 0 END)
+            FROM (
+                SELECT file_path, process_name, process_path, created_at,
+                       CASE WHEN is_directory <> 0 THEN 'create_dir' ELSE 'create_file' END AS action
+                FROM file_origins
+                UNION ALL
+                SELECT file_path, process_name, process_path, modified_at, 'modify'
+                FROM file_modifications
+                UNION ALL
+                SELECT file_path, process_name, process_path, deleted_at,
+                       CASE WHEN is_directory <> 0 THEN 'delete_dir' ELSE 'delete_file' END
+                FROM file_deletions
+            ) AS t
+            LEFT JOIN program_notes n ON n.process_path = t.process_path
+            WHERE t.file_path <> '' AND t.process_name <> '' AND t.process_path <> ''
+            GROUP BY t.process_path
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(ProgramStat {
+                process_name: row.get(0)?,
+                process_path: row.get(1)?,
+                note: row.get(2)?,
+                create_file: row.get(3)?,
+                create_dir: row.get(4)?,
+                modify: row.get(5)?,
+                delete_file: row.get(6)?,
+                delete_dir: row.get(7)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// 取某个程序某一类动作的明细记录（按时间倒序，最多 `limit` 条）。
+    ///
+    /// 统计窗口里展开「创建文件夹」等单元格时调用它：
+    /// `action` 限定只取该类型，保证展开出来的明细和该列的数字对得上。
+    pub fn records_by_process_action(
+        &self,
+        process_path: &str,
+        action: &str,
+        limit: u32,
+    ) -> Result<Vec<FileOrigin>> {
+        let conn = self.lock_connection();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT t.file_path, t.process_name, t.process_path, t.created_at, t.action,
+                   COALESCE(n.note, '')
+            FROM (
+                SELECT file_path, process_name, process_path, created_at,
+                       CASE WHEN is_directory <> 0 THEN 'create_dir' ELSE 'create_file' END AS action
+                FROM file_origins
+                UNION ALL
+                SELECT file_path, process_name, process_path, modified_at, 'modify'
+                FROM file_modifications
+                UNION ALL
+                SELECT file_path, process_name, process_path, deleted_at,
+                       CASE WHEN is_directory <> 0 THEN 'delete_dir' ELSE 'delete_file' END
+                FROM file_deletions
+            ) AS t
+            LEFT JOIN program_notes n ON n.process_path = t.process_path
+            WHERE t.process_path = ?1 AND t.action = ?2 AND t.file_path <> ''
+            ORDER BY t.created_at DESC
+            LIMIT ?3
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![process_path, action, limit], |row| {
+            Ok(FileOrigin {
+                file_path: row.get(0)?,
+                process_name: row.get(1)?,
+                process_path: row.get(2)?,
+                created_at: row.get(3)?,
+                action: row.get(4)?,
+                note: row.get(5)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// 取某个程序的**所有类型**明细记录（按时间倒序，最多 `limit` 条）。
+    ///
+    /// 双击统计窗口的「合计」列时调用它：创建文件、修改、删除等会混在一起，
+    /// 方便看这个程序最近到底都干了什么。
+    pub fn records_by_process(&self, process_path: &str, limit: u32) -> Result<Vec<FileOrigin>> {
+        let conn = self.lock_connection();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT t.file_path, t.process_name, t.process_path, t.created_at, t.action,
+                   COALESCE(n.note, '')
+            FROM (
+                SELECT file_path, process_name, process_path, created_at,
+                       CASE WHEN is_directory <> 0 THEN 'create_dir' ELSE 'create_file' END AS action
+                FROM file_origins
+                UNION ALL
+                SELECT file_path, process_name, process_path, modified_at, 'modify'
+                FROM file_modifications
+                UNION ALL
+                SELECT file_path, process_name, process_path, deleted_at,
+                       CASE WHEN is_directory <> 0 THEN 'delete_dir' ELSE 'delete_file' END
+                FROM file_deletions
+            ) AS t
+            LEFT JOIN program_notes n ON n.process_path = t.process_path
+            WHERE t.process_path = ?1 AND t.file_path <> ''
+            ORDER BY t.created_at DESC
+            LIMIT ?2
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![process_path, limit], |row| {
+            Ok(FileOrigin {
+                file_path: row.get(0)?,
+                process_name: row.get(1)?,
+                process_path: row.get(2)?,
+                created_at: row.get(3)?,
+                action: row.get(4)?,
+                note: row.get(5)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// 删除某个程序的**全部**记录（三张表一起删）。
+    ///
+    /// 供「程序统计」窗口右键「删除该程序的全部记录」使用。
+    /// 返回实际删除的行数，方便上层打日志。
+    pub fn delete_program_records(&self, process_path: &str) -> Result<usize> {
+        let conn = self.lock_connection();
+        let mut deleted = 0;
+        deleted += conn.execute(
+            "DELETE FROM file_origins WHERE process_path = ?1",
+            params![process_path],
+        )?;
+        deleted += conn.execute(
+            "DELETE FROM file_modifications WHERE process_path = ?1",
+            params![process_path],
+        )?;
+        deleted += conn.execute(
+            "DELETE FROM file_deletions WHERE process_path = ?1",
+            params![process_path],
+        )?;
+        Ok(deleted)
+    }
+
+    /// 删除某个程序**某一类动作**的全部记录。
+    ///
+    /// 供统计窗口右键某个计数单元格使用，例如「删除 explorer.exe 的全部创建文件夹记录」。
+    /// 创建 / 删除两类共用一张表，靠 `is_directory` 区分文件与文件夹。
+    pub fn delete_program_action_records(&self, process_path: &str, action: &str) -> Result<usize> {
+        let conn = self.lock_connection();
+        let deleted = match action {
+            "create_file" => conn.execute(
+                "DELETE FROM file_origins WHERE process_path = ?1 AND is_directory = 0",
+                params![process_path],
+            )?,
+            "create_dir" => conn.execute(
+                "DELETE FROM file_origins WHERE process_path = ?1 AND is_directory <> 0",
+                params![process_path],
+            )?,
+            "modify" => conn.execute(
+                "DELETE FROM file_modifications WHERE process_path = ?1",
+                params![process_path],
+            )?,
+            "delete_file" => conn.execute(
+                "DELETE FROM file_deletions WHERE process_path = ?1 AND is_directory = 0",
+                params![process_path],
+            )?,
+            _ => conn.execute(
+                "DELETE FROM file_deletions WHERE process_path = ?1 AND is_directory <> 0",
+                params![process_path],
+            )?,
+        };
+        Ok(deleted)
+    }
+
+    /// 删除一条具体记录。
+    ///
+    /// `action` 决定该去删哪张表：
+    /// - `modify` → file_modifications
+    /// - `delete_file` / `delete_dir` → file_deletions
+    /// - 其余（创建文件 / 创建文件夹）→ file_origins
+    ///
+    /// 同一路径可能同时存在「创建」和「删除」两条记录（分表存放），
+    /// 所以这里只按动作对应的那张表删除，不会误删另一条。
+    pub fn delete_record(&self, file_path: &str, action: &str) -> Result<usize> {
+        let conn = self.lock_connection();
+        let deleted = match action {
+            "modify" => conn.execute(
+                "DELETE FROM file_modifications WHERE file_path = ?1",
+                params![file_path],
+            )?,
+            "delete_file" | "delete_dir" => conn.execute(
+                "DELETE FROM file_deletions WHERE file_path = ?1",
+                params![file_path],
+            )?,
+            _ => conn.execute(
+                "DELETE FROM file_origins WHERE file_path = ?1",
+                params![file_path],
+            )?,
+        };
+        Ok(deleted)
     }
 
     /// 清理 N 天前的旧记录（防止数据库无限增长）
@@ -717,6 +1001,133 @@ mod tests {
         let deleted = db.maintain(7).unwrap();
         assert_eq!(deleted, 50);
         assert_eq!(db.count().unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 验证「程序统计」：五类计数、合计，以及按类型取明细时只返回该类型。
+    #[test]
+    fn program_stats_groups_and_filters_by_action() {
+        let dir = std::env::temp_dir().join("file_origin_tracker_db_test_stats");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Database::init(&dir).unwrap();
+
+        // 程序 A：创建 1 文件 + 1 文件夹，修改 1 文件，删除 1 文件。
+        db.upsert_origin(r"C:\a\one.txt", "a.exe", r"C:\a.exe", false)
+            .unwrap();
+        db.upsert_origin(r"C:\a\folder", "a.exe", r"C:\a.exe", true)
+            .unwrap();
+        db.upsert_modification(r"C:\a\one.txt", "a.exe", r"C:\a.exe")
+            .unwrap();
+        db.upsert_deletion(r"C:\a\one.txt", "a.exe", r"C:\a.exe", false)
+            .unwrap();
+
+        // 程序 B：只创建一个文件，用来验证分组互不干扰。
+        db.upsert_origin(r"C:\b\two.txt", "b.exe", r"C:\b.exe", false)
+            .unwrap();
+
+        let stats = db.program_stats().unwrap();
+        assert_eq!(stats.len(), 2);
+
+        let a = stats
+            .iter()
+            .find(|stat| stat.process_path == r"C:\a.exe")
+            .unwrap();
+        assert_eq!(a.create_file, 1);
+        assert_eq!(a.create_dir, 1);
+        assert_eq!(a.modify, 1);
+        assert_eq!(a.delete_file, 1);
+        assert_eq!(a.delete_dir, 0);
+        assert_eq!(a.total(), 4);
+
+        let b = stats
+            .iter()
+            .find(|stat| stat.process_path == r"C:\b.exe")
+            .unwrap();
+        assert_eq!(b.create_file, 1);
+        assert_eq!(b.total(), 1);
+
+        // 明细必须严格按类型过滤：展开「创建文件夹」时不能混进创建文件。
+        let folders = db
+            .records_by_process_action(r"C:\a.exe", "create_dir", 100)
+            .unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].file_path, r"C:\a\folder");
+        assert_eq!(folders[0].action, "create_dir");
+
+        let creates = db
+            .records_by_process_action(r"C:\a.exe", "create_file", 100)
+            .unwrap();
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0].file_path, r"C:\a\one.txt");
+        assert_eq!(creates[0].action, "create_file");
+
+        // 换一个程序查询同类型，结果不能串到程序 A 的数据。
+        assert!(db
+            .records_by_process_action(r"C:\b.exe", "create_dir", 100)
+            .unwrap()
+            .is_empty());
+
+        // 「合计」展开会取全部类型：程序 A 应该有创建 / 修改 / 删除共 4 条。
+        let all_a = db.records_by_process(r"C:\a.exe", 100).unwrap();
+        assert_eq!(all_a.len(), 4);
+        // 结果按时间倒序，这里只验证类型齐全，不依赖具体顺序。
+        let actions: Vec<&str> = all_a.iter().map(|row| row.action.as_str()).collect();
+        assert!(actions.contains(&"create_file"));
+        assert!(actions.contains(&"create_dir"));
+        assert!(actions.contains(&"modify"));
+        assert!(actions.contains(&"delete_file"));
+        // 另一个程序只有 1 条。
+        assert_eq!(db.records_by_process(r"C:\b.exe", 100).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 验证删除：单条删除只动动作对应的那张表，
+    /// 程序级删除会清掉该程序在三张表里的所有记录，且不影响其它程序。
+    #[test]
+    fn delete_program_and_single_records() {
+        let dir = std::env::temp_dir().join("file_origin_tracker_db_test_delete_stats");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Database::init(&dir).unwrap();
+
+        db.upsert_origin(r"C:\a\one.txt", "a.exe", r"C:\a.exe", false)
+            .unwrap();
+        db.upsert_origin(r"C:\a\folder", "a.exe", r"C:\a.exe", true)
+            .unwrap();
+        db.upsert_modification(r"C:\a\one.txt", "a.exe", r"C:\a.exe")
+            .unwrap();
+        db.upsert_deletion(r"C:\a\one.txt", "a.exe", r"C:\a.exe", false)
+            .unwrap();
+        db.upsert_origin(r"C:\b\two.txt", "b.exe", r"C:\b.exe", false)
+            .unwrap();
+
+        // 按类型删除：只删 a.exe 的「创建文件夹」，其它类型全部保留。
+        assert_eq!(
+            db.delete_program_action_records(r"C:\a.exe", "create_dir")
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.records_by_process(r"C:\a.exe", 100).unwrap().len(), 3);
+
+        // 单条删除：只删掉「创建文件」这一条，同路径的修改 / 删除记录必须保留。
+        assert_eq!(db.delete_record(r"C:\a\one.txt", "create_file").unwrap(), 1);
+        let remaining = db.recent_filtered(50, None).unwrap();
+        assert!(!remaining
+            .iter()
+            .any(|row| row.file_path == r"C:\a\one.txt" && row.action == "create_file"));
+        assert!(remaining
+            .iter()
+            .any(|row| row.file_path == r"C:\a\one.txt" && row.action == "modify"));
+        assert!(remaining
+            .iter()
+            .any(|row| row.file_path == r"C:\a\one.txt" && row.action == "delete_file"));
+
+        // 程序级删除：a.exe 还剩 2 条（one 修改、one 删除）。
+        assert_eq!(db.delete_program_records(r"C:\a.exe").unwrap(), 2);
+        let remaining = db.recent_filtered(50, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].process_path, r"C:\b.exe");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
