@@ -1,13 +1,17 @@
-﻿# 把主程序 exe 和右键菜单扩展 DLL 合并成一个单文件 exe。
+﻿# 生成两个发行包：
+#   1. 双文件版（推荐）：FileOriginTracker.exe + file_origin_tracker_shell.dll
+#   2. 单文件版：把 DLL 作为 RCDATA 资源写进 exe，启动时自动释放
 #
-# 合并方式：在 exe 末尾追加 [DLL 内容][8 字节长度][16 字节标记]。
-# Windows 加载 exe 时会忽略末尾的附加数据，程序启动后会自己把 DLL
-# 释放到 %LOCALAPPDATA%\FileOriginTracker\FileOriginTracker\data\shell\。
+# 单文件版虽然方便携带，但“程序运行时把 PE 文件写到磁盘”是木马加载器的
+# 典型行为，可能被 360 的 QVM 等机器学习引擎误报，所以默认推荐双文件版。
 #
 # 用法（在项目根目录或任意位置执行都可以）：
 #   powershell -ExecutionPolicy Bypass -File tools\pack.ps1
 # 产物：
-#   dist\FileOriginTracker.exe
+#   dist\FileOriginTracker.exe                        双文件版主程序
+#   dist\file_origin_tracker_shell.dll                双文件版扩展 DLL
+#   dist\FileOriginTracker-v<版本号>.zip              双文件版发行包
+#   dist\FileOriginTracker-single.exe                 单文件版（直接分发，不打压缩包）
 
 $ErrorActionPreference = 'Stop'
 
@@ -29,25 +33,84 @@ foreach ($file in @($exe, $dll)) {
     if (-not (Test-Path $file)) { throw "缺少产物：$file" }
 }
 
-# 2. 读取两个文件的内容并拼接
-$exeBytes = [System.IO.File]::ReadAllBytes($exe)
-$dllBytes = [System.IO.File]::ReadAllBytes($dll)
-$magic = [System.Text.Encoding]::ASCII.GetBytes('FOT-SHELL-DLL-01')
-$lengthBytes = [System.BitConverter]::GetBytes([int64]$dllBytes.Length)
-
-$output = New-Object byte[] ($exeBytes.Length + $dllBytes.Length + $lengthBytes.Length + $magic.Length)
-[System.Array]::Copy($exeBytes, 0, $output, 0, $exeBytes.Length)
-[System.Array]::Copy($dllBytes, 0, $output, $exeBytes.Length, $dllBytes.Length)
-[System.Array]::Copy($lengthBytes, 0, $output, $exeBytes.Length + $dllBytes.Length, $lengthBytes.Length)
-[System.Array]::Copy($magic, 0, $output, $exeBytes.Length + $dllBytes.Length + $lengthBytes.Length, $magic.Length)
-
-# 3. 写到 dist 目录
+# 2. 复制主程序和 DLL 到 dist（双文件版）
 $dist = Join-Path $project 'dist'
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
-$single = Join-Path $dist 'FileOriginTracker.exe'
-[System.IO.File]::WriteAllBytes($single, $output)
 
+$single = Join-Path $dist 'FileOriginTracker.exe'
+$dllCopy = Join-Path $dist 'file_origin_tracker_shell.dll'
+Copy-Item -Path $exe -Destination $single -Force
+Copy-Item -Path $dll -Destination $dllCopy -Force
+
+# 从 Cargo.toml 读取版本号，用于 zip 文件名
+$version = '0.0.0'
+$cargoToml = Join-Path $project 'Cargo.toml'
+if (Test-Path $cargoToml) {
+    $match = Select-String -Path $cargoToml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+    if ($match) { $version = $match.Matches[0].Groups[1].Value }
+}
+
+# 3. 双文件版发行包
+$zip = Join-Path $dist ("FileOriginTracker-v{0}.zip" -f $version)
+Compress-Archive -Path $single, $dllCopy -DestinationPath $zip -Force
+
+# 4. 单文件版：把 DLL 作为 RCDATA 资源写进 exe 副本
+$singleExe = Join-Path $dist 'FileOriginTracker-single.exe'
+Copy-Item -Path $exe -Destination $singleExe -Force
+
+$dllBytes = [System.IO.File]::ReadAllBytes($dll)
+
+# 重复执行本脚本时 PowerShell 会复用已加载的类型，不会重复定义。
+if (-not ('FotResourcePatcher' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class FotResourcePatcher
+{
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr BeginUpdateResource(string fileName, bool deleteExistingResources);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool UpdateResource(IntPtr update, IntPtr type, IntPtr name, ushort language, byte[] data, uint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool EndUpdateResource(IntPtr update, bool discard);
+}
+'@
+}
+
+$handle = [FotResourcePatcher]::BeginUpdateResource($singleExe, $false)
+if ($handle -eq [IntPtr]::Zero) {
+    throw "打开单文件版 exe 失败：$singleExe"
+}
+
+$written = $false
+try {
+    # 参数依次是：资源类型 RT_RCDATA(10)、资源 ID(101)、语言 0（中性）。
+    $written = [FotResourcePatcher]::UpdateResource(
+        $handle, [IntPtr]10, [IntPtr]101, 0, $dllBytes, [uint32]$dllBytes.Length)
+    if (-not $written) {
+        $code = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "写入 DLL 资源失败（错误码：$code）"
+    }
+}
+finally {
+    # 写入失败时丢弃改动，避免在 dist 留下一个不完整的 exe。
+    if (-not [FotResourcePatcher]::EndUpdateResource($handle, (-not $written))) {
+        throw '保存单文件版 exe 失败'
+    }
+}
+
+# 单文件版不打包 zip：它本身就是一个 exe，直接提供下载即可。
+
+# 5. 输出结果
 Write-Host ''
-Write-Host "已生成单文件程序：$single"
-Write-Host ("大小：{0:N2} MB（exe {1:N2} MB + dll {2:N2} MB）" -f `
-    ($output.Length / 1MB), ($exeBytes.Length / 1MB), ($dllBytes.Length / 1MB))
+Write-Host '已生成发行文件：'
+Write-Host ("  {0}（{1:N2} MB）" -f $single, ((Get-Item $single).Length / 1MB))
+Write-Host ("  {0}（{1:N2} MB）" -f $dllCopy, ((Get-Item $dllCopy).Length / 1MB))
+Write-Host ("  {0}（{1:N2} MB）" -f $zip, ((Get-Item $zip).Length / 1MB))
+Write-Host ("  {0}（{1:N2} MB）" -f $singleExe, ((Get-Item $singleExe).Length / 1MB))
+Write-Host ''
+Write-Host '注意：单文件版会在运行时把 DLL 释放到数据目录，可能被 360 等杀毒软件误报。'
+Write-Host '      如果被拦截，请改用双文件版（exe 与 dll 放在同一目录，推荐）。'

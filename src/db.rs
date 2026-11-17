@@ -18,7 +18,7 @@ pub struct Database {
 }
 
 /// 一条文件来源记录
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileOrigin {
     /// 文件/文件夹的完整路径
     pub file_path: String,
@@ -355,7 +355,7 @@ impl Database {
             LEFT JOIN program_notes n ON n.process_path = t.process_path
             WHERE t.file_path <> '' AND t.process_name <> '' AND t.process_path <> ''
               AND (?2 IS NULL OR (t.created_at >= ?2 AND t.created_at <= ?3))
-            ORDER BY t.created_at DESC
+            ORDER BY t.created_at DESC, t.file_path ASC, t.action ASC
             LIMIT ?1
             "#,
         )?;

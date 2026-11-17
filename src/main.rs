@@ -252,8 +252,13 @@ fn main() -> Result<()> {
 
     // 6. 单文件版：先把 exe 内打包的右键菜单扩展 DLL 释放到数据目录。
     //    开发版（exe 里没有打包数据）这里什么都不做，仍然使用同目录的 DLL。
-    if let Some(dll) = shell_menu::unpack_shell_dll() {
-        info!("右键菜单扩展已就绪：{}", dll.display());
+    // 右键菜单扩展 DLL 与主程序放在同一目录（双文件分发）。
+    // 程序不再从自身资源里释放 DLL，避免“把可执行文件写到磁盘”这种
+    // 容易被杀软判定为恶意加载器的行为。
+    match shell_menu::dll_path() {
+        Ok(dll) if dll.exists() => info!("右键菜单扩展已就绪：{}", dll.display()),
+        Ok(dll) => warn!("未找到右键菜单扩展 DLL：{}", dll.display()),
+        Err(error) => warn!("无法确定右键菜单扩展路径：{:#}", error),
     }
 
     // 7. 注册右键菜单扩展（写入当前用户注册表，不需要管理员权限）

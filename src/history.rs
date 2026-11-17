@@ -24,6 +24,7 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
 };
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::Graphics::Gdi::{ScreenToClient, SetBkColor, SetTextColor, UpdateWindow};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -36,10 +37,11 @@ use windows::Win32::UI::Controls::{
     DTM_GETSYSTEMTIME, DTM_SETFORMATW, ICC_DATE_CLASSES, ICC_LISTVIEW_CLASSES,
     INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
     LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
-    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST, LVN_COLUMNCLICK, LVN_ITEMACTIVATE,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, NMHDR, NMLISTVIEW, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_RCLICK,
+    LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNW,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST,
+    LVNI_SELECTED, LVN_COLUMNCLICK, LVN_ITEMACTIVATE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMLISTVIEW,
+    NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_RCLICK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetClientRect,
@@ -50,8 +52,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL,
     TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_NOTIFY,
-    WM_NULL, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WM_NULL, WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER,
+    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::db::{Database, FileOrigin};
@@ -63,6 +65,12 @@ const WINDOW_CLASS: &str = "FileOriginTrackerHistoryWindow";
 /// 自动刷新间隔（毫秒）。只在窗口激活时启用。
 const REFRESH_TIMER_ID: usize = 1;
 const REFRESH_INTERVAL_MS: u32 = 10_000;
+
+/// WM_VSCROLL：标准垂直滚动消息。
+const WM_VSCROLL: u32 = 0x0115;
+
+/// SB_LINEDOWN：WM_VSCROLL 的 wParam 取值，表示向下滚动一行。
+const SB_LINEDOWN: usize = 1;
 
 /// 最多展示的记录条数，避免列表过大影响打开速度。
 const MAX_ROWS: u32 = 500;
@@ -290,7 +298,7 @@ unsafe extern "system" fn window_procedure(
             match id {
                 // 搜索框内容变化：立刻按关键字重新过滤列表。
                 _ if id == SEARCH_CONTROL_ID as u32 && code == EN_CHANGE_CODE => {
-                    apply_filter();
+                    apply_filter(false);
                 }
                 // 清除时间筛选：两个复选框取消勾选，重新读取全部记录。
                 _ if id == FILTER_CLEAR_BUTTON_ID as u32 => {
@@ -298,7 +306,7 @@ unsafe extern "system" fn window_procedure(
                 }
                 // 「起 / 止」复选框被点击：按新的勾选状态立即刷新列表。
                 _ if id == FILTER_START_ENABLE_ID as u32 || id == FILTER_END_ENABLE_ID as u32 => {
-                    refresh_list();
+                    reload_list();
                 }
                 MENU_OPEN_PATH => {
                     if let Some(row) = context_row() {
@@ -383,7 +391,7 @@ unsafe extern "system" fn window_procedure(
                         // 点击列头：按该列排序；再点同一列则切换升序 / 降序。
                         let info = &*(lparam.0 as *const NMLISTVIEW);
                         toggle_sort(info.iSubItem);
-                        apply_filter();
+                        apply_filter(false);
                     }
                     NM_CUSTOMDRAW => {
                         // 自定义绘制：只为「类型」列刷彩色背景，其它列保持系统默认绘制。
@@ -801,17 +809,45 @@ fn open_path_target(row: &FileOrigin) {
     }
 }
 
-/// 从数据库重新读取记录，再按当前搜索关键字刷新列表。
+/// 后台定时刷新（每 10 秒一次）。
+///
+/// 关键点：只有数据真的变化时才重建列表。
+/// 早先的做法是每个刷新周期都把列表删空再重新插入，用户往下翻历史记录时
+/// 就会看到列表“闪一下”并被弹回顶部，完全没法浏览。
+/// 绝大多数刷新周期里并没有新记录，直接返回即可。
 fn refresh_list() {
+    let rows = load_rows();
+
+    // 和上次读到的数据完全相同就什么都不做，连重绘都不触发。
+    let unchanged = ALL_ROWS.lock().map(|cache| *cache == rows).unwrap_or(false);
+    if unchanged {
+        return;
+    }
+
+    if let Ok(mut cache) = ALL_ROWS.lock() {
+        *cache = rows;
+    }
+    // 有新记录：重建列表，但保持用户当前的滚动位置。
+    apply_filter(true);
+}
+
+/// 用户主动改变筛选条件（搜索 / 排序 / 时间范围）后刷新列表。
+///
+/// 这时列表内容本来就会整体变化，恢复旧滚动位置没有意义，
+/// 回到顶部更符合预期，所以不保持滚动位置。
+fn reload_list() {
     let rows = load_rows();
     if let Ok(mut cache) = ALL_ROWS.lock() {
         *cache = rows;
     }
-    apply_filter();
+    apply_filter(false);
 }
 
 /// 按搜索框里的关键字过滤记录，并重新填充列表。
-fn apply_filter() {
+///
+/// `keep_scroll` 为 true 时尽量保持用户当前的滚动位置和选中行（定时刷新用）；
+/// 用户主动改了筛选条件时传 false，列表直接回到顶部。
+fn apply_filter(keep_scroll: bool) {
     let keyword = search_text().to_lowercase();
     let rows = ALL_ROWS
         .lock()
@@ -828,7 +864,7 @@ fn apply_filter() {
 
     let mut filtered = filtered;
     sort_rows(&mut filtered);
-    fill_list(&filtered);
+    fill_list(&filtered, keep_scroll);
 }
 
 /// 判断一条记录是否匹配搜索关键字（程序名 / 路径 / 类型 / 备注，忽略大小写）。
@@ -934,7 +970,7 @@ fn clear_time_filter() {
             }
         }
     }
-    refresh_list();
+    reload_list();
 }
 
 /// 切换排序列 / 升降序。
@@ -1064,7 +1100,10 @@ unsafe fn handle_custom_draw(lparam: LPARAM) -> LRESULT {
 }
 
 /// 把给定记录填入列表，并同步行缓存（双击 / 右键要靠它按行号找回记录）。
-fn fill_list(rows: &[FileOrigin]) {
+///
+/// `keep_scroll` 为 true 时，重建前记住第一条可见的行和选中的行，
+/// 重建后原样恢复，避免后台刷新把用户从正在看的位置“拽”回顶部。
+fn fill_list(rows: &[FileOrigin], keep_scroll: bool) {
     let list = HWND(LIST_VIEW.load(Ordering::SeqCst) as *mut c_void);
     if list.0.is_null() {
         return;
@@ -1075,6 +1114,31 @@ fn fill_list(rows: &[FileOrigin]) {
     }
 
     unsafe {
+        // 保存第一条可见行的下标：列表重建后会回到顶部，后面用它滚回去。
+        let top_index = if keep_scroll {
+            SendMessageW(list, LVM_GETTOPINDEX, WPARAM(0), LPARAM(0)).0 as i32
+        } else {
+            0
+        };
+
+        // 保存选中行；不需要保持时用 -1 作为哨兵，后面会跳过恢复。
+        let selected = if keep_scroll {
+            SendMessageW(
+                list,
+                LVM_GETNEXTITEM,
+                // wParam = -1 表示从第一行开始往后找
+                WPARAM(usize::MAX),
+                LPARAM(LVNI_SELECTED as isize),
+            )
+            .0 as i32
+        } else {
+            -1
+        };
+
+        // 暂停重绘：删除 → 逐行插入的过程中会产生大量中间状态，
+        // 不关掉重绘就会看到列表整片闪白。
+        SendMessageW(list, WM_SETREDRAW, WPARAM(0), LPARAM(0));
+
         SendMessageW(list, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
 
         for (index, row) in rows.iter().enumerate() {
@@ -1107,6 +1171,29 @@ fn fill_list(rows: &[FileOrigin]) {
             // 类型列：让用户直观看到这条记录属于哪类监控。
             let action_text = wide(&action_label(&row.action));
             insert_sub_item(list, row_index, 3, &action_text);
+        }
+
+        // 恢复重绘，并主动请求重画一次，避免列表停留在空白状态。
+        SendMessageW(list, WM_SETREDRAW, WPARAM(1), LPARAM(0));
+        let _ = InvalidateRect(list, None, true);
+
+        // 恢复滚动位置：ListView 在“删除全部 + 重新插入”后会回到顶部，
+        // 这里用 WM_VSCROLL 逐行滚回去。
+        // 不用 LVM_SETTOPINDEX 是因为实测它对当前列表控件不生效（设置后读回仍是 0）。
+        if keep_scroll && top_index > 0 && !rows.is_empty() {
+            let target = top_index.min(rows.len() as i32 - 1);
+            // 滚动过程临时关闭重绘，避免几百次重绘造成闪烁。
+            SendMessageW(list, WM_SETREDRAW, WPARAM(0), LPARAM(0));
+            for _ in 0..target {
+                SendMessageW(list, WM_VSCROLL, WPARAM(SB_LINEDOWN), LPARAM(0));
+            }
+            SendMessageW(list, WM_SETREDRAW, WPARAM(1), LPARAM(0));
+            let _ = InvalidateRect(list, None, true);
+        }
+
+        // 恢复选中行：索引必须仍然有效，否则会错误地选中另一条记录。
+        if keep_scroll && selected >= 0 && (selected as usize) < rows.len() {
+            select_row(list, selected as usize);
         }
     }
 }
