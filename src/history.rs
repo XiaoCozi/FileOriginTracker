@@ -12,7 +12,9 @@
 //! - 「类型」列按记录种类显示彩色底：新建文件=天蓝、新建文件夹=青绿、
 //!   修改文件=浅紫、删除文件=红、删除文件夹=橙
 //! - 双击「创建程序」列打开程序所在目录，双击「路径」列打开文件所在目录
-//! - 在记录上点右键弹出菜单：打开文件路径 / 复制词条 / 打开创建程序所在目录
+//!
+//! 注意：记录操作（打开路径 / 复制词条 / 打开程序目录 / 设置备注 / 加入名单）
+//! 已统一放到「程序统计」窗口的右键菜单，这里不再提供右键菜单。
 
 use anyhow::Result;
 use once_cell::sync::Lazy;
@@ -41,19 +43,17 @@ use windows::Win32::UI::Controls::{
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST,
     LVNI_SELECTED, LVN_COLUMNCLICK, LVN_ITEMACTIVATE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
     LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMLISTVIEW,
-    NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_RCLICK,
+    NMLVCUSTOMDRAW, NM_CUSTOMDRAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetClientRect,
-    GetCursorPos, GetMessageW, GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MessageBoxW,
-    MoveWindow, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
-    ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
-    BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW,
-    MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL,
-    TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_NOTIFY,
-    WM_NULL, WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER,
-    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW,
+    GetWindowTextW, KillTimer, LoadCursorW, MessageBoxW, MoveWindow, RegisterClassExW, SendMessageW,
+    SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK,
+    BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL,
+    IDC_ARROW, MB_ICONINFORMATION, MB_OK, MSG, SW_HIDE, SW_SHOWNORMAL, WA_INACTIVE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT,
+    WM_CTLCOLORSTATIC, WM_NOTIFY, WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER,
+    WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::db::{Database, FileOrigin};
@@ -170,14 +170,6 @@ fn type_cell_text_color(action: &str) -> COLORREF {
 /// 编辑框内容变化时向父窗口发送的通知码（commctrl 之外的 Windows 标准通知）。
 const EN_CHANGE_CODE: u32 = 0x0300;
 
-/// 右键菜单命令 ID。
-const MENU_OPEN_PATH: u32 = 4001;
-const MENU_COPY_ENTRY: u32 = 4002;
-const MENU_OPEN_PROGRAM_DIR: u32 = 4003;
-const MENU_SET_NOTE: u32 = 4004;
-/// 把这条记录里的「创建程序」加入当前黑/白名单。
-const MENU_ADD_TO_LIST: u32 = 4005;
-
 /// 剪贴板文本格式（CF_UNICODETEXT）。
 const CF_UNICODETEXT: u32 = 13;
 
@@ -186,15 +178,12 @@ const TOOLBAR_HEIGHT: i32 = 36;
 
 /// 当前列表里显示的行数据。
 ///
-/// ListView 只保存文本，双击 / 右键时需要按行号找回完整记录（程序路径、文件路径），
+/// ListView 只保存文本，双击时需要按行号找回完整记录（程序路径、文件路径），
 /// 所以刷新列表时同步缓存一份。
 static ROW_CACHE: Lazy<Mutex<Vec<FileOrigin>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 /// 从数据库读到的全部记录（未过滤）。切换搜索关键字时从这份数据里筛，不用重新查库。
 static ALL_ROWS: Lazy<Mutex<Vec<FileOrigin>>> = Lazy::new(|| Mutex::new(Vec::new()));
-
-/// 右键菜单当前针对的行号（-1 表示没有）。
-static CONTEXT_ROW: AtomicIsize = AtomicIsize::new(-1);
 
 /// 记录窗口使用的只读数据库连接（惰性打开，打开失败时列表为空）。
 static HISTORY_DB: Lazy<Mutex<Option<Database>>> = Lazy::new(|| Mutex::new(None));
@@ -316,31 +305,6 @@ unsafe extern "system" fn window_procedure(
                 _ if id == FILTER_START_ENABLE_ID as u32 || id == FILTER_END_ENABLE_ID as u32 => {
                     reload_list();
                 }
-                MENU_OPEN_PATH => {
-                    if let Some(row) = context_row() {
-                        open_path_target(&row);
-                    }
-                }
-                MENU_COPY_ENTRY => {
-                    if let Some(row) = context_row() {
-                        copy_to_clipboard(&row.file_path);
-                    }
-                }
-                MENU_OPEN_PROGRAM_DIR => {
-                    if let Some(row) = context_row() {
-                        crate::util::reveal_in_explorer(&row.process_path);
-                    }
-                }
-                MENU_SET_NOTE => {
-                    if let Some(row) = context_row() {
-                        edit_program_note(&row);
-                    }
-                }
-                MENU_ADD_TO_LIST => {
-                    if let Some(row) = context_row() {
-                        add_program_to_list(&row);
-                    }
-                }
                 _ => {}
             }
             LRESULT(0)
@@ -386,13 +350,6 @@ unsafe extern "system" fn window_procedure(
                                 }
                             }
                             open_row_target(index, sub_item);
-                        }
-                    }
-                    NM_RCLICK => {
-                        // 右键点在记录上：选中该行并弹出操作菜单。
-                        if let Some((index, _)) = hit_test_item(list) {
-                            select_row(list, index);
-                            show_row_menu(hwnd, index);
                         }
                     }
                     LVN_COLUMNCLICK => {
@@ -831,7 +788,9 @@ fn cached_row(index: usize) -> Option<FileOrigin> {
 ///
 /// - 普通文件：打开所在目录并选中它
 /// - 文件夹：直接打开这个文件夹
-fn open_path_target(row: &FileOrigin) {
+///
+/// 该函数对「程序统计」窗口同样可用，所以是 crate 内公开的。
+pub(crate) fn open_path_target(row: &FileOrigin) {
     if std::path::Path::new(&row.file_path).is_dir() {
         crate::util::open_directory(&row.file_path);
     } else {
@@ -1242,70 +1201,10 @@ unsafe fn select_row(list: HWND, index: usize) {
     );
 }
 
-/// 在右键位置弹出记录操作菜单。
-unsafe fn show_row_menu(window: HWND, index: usize) {
-    CONTEXT_ROW.store(index as isize, Ordering::SeqCst);
-
-    let Ok(menu) = CreatePopupMenu() else {
-        return;
-    };
-
-    let items: [(u32, &str); 5] = [
-        (MENU_OPEN_PATH, "打开文件路径"),
-        (MENU_COPY_ENTRY, "复制词条"),
-        (MENU_OPEN_PROGRAM_DIR, "打开创建程序所在目录"),
-        (MENU_SET_NOTE, "设置程序备注…"),
-        (MENU_ADD_TO_LIST, menu_add_to_list_text()),
-    ];
-
-    for (position, (command, text)) in items.iter().enumerate() {
-        let text = wide(text);
-        let _ = InsertMenuW(
-            menu,
-            position as u32,
-            MF_BYPOSITION | MF_STRING,
-            *command as usize,
-            PCWSTR(text.as_ptr()),
-        );
-    }
-    // 前两项是“对这条记录本身的操作”，后面几项针对创建者程序，用分隔线隔开。
-    let _ = InsertMenuW(menu, 2, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
-
-    let mut point = POINT::default();
-    if GetCursorPos(&mut point).is_err() {
-        let _ = DestroyMenu(menu);
-        return;
-    }
-
-    // TrackPopupMenu 要求窗口在前台，否则点菜单外面菜单不会消失。
-    let _ = SetForegroundWindow(window);
-    let _ = TrackPopupMenu(
-        menu,
-        TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
-        point.x,
-        point.y,
-        0,
-        window,
-        None,
-    );
-    let _ = DestroyMenu(menu);
-    // 让菜单正常关闭（Windows 官方示例里的做法）。
-    let _ = PostMessageW(window, WM_NULL, WPARAM(0), LPARAM(0));
-}
-
-/// 右键菜单当前针对的记录。
-fn context_row() -> Option<FileOrigin> {
-    let index = CONTEXT_ROW.load(Ordering::SeqCst);
-    if index < 0 {
-        return None;
-    }
-    cached_row(index as usize)
-}
-
 /// 右键菜单里「加入名单」这一项的显示文字。
 ///
 /// 名称随设置里的模式变化，用户不用打开设置也能知道会加进哪个名单。
-fn menu_add_to_list_text() -> &'static str {
+pub(crate) fn menu_add_to_list_text() -> &'static str {
     match crate::config::Config::load_or_default() {
         Ok(config) if config.is_white_list() => "加入白名单（此程序）",
         _ => "加入黑名单（此程序）",
@@ -1316,7 +1215,10 @@ fn menu_add_to_list_text() -> &'static str {
 ///
 /// 加入黑名单后，这个程序以后再创建/修改文件都不会被记录；
 /// 加入白名单后，则只有这个程序的操作会被记录（白名单模式下）。
-fn add_program_to_list(row: &FileOrigin) {
+///
+/// `owner` 是弹出提示框时使用的父窗口：从「最近记录」窗口调用时是记录窗口，
+/// 从「程序统计」窗口调用时是统计窗口。
+pub(crate) fn add_program_to_list(owner: HWND, process_path: &str) {
     let config = match crate::config::Config::load_or_default() {
         Ok(config) => config,
         Err(error) => {
@@ -1328,25 +1230,24 @@ fn add_program_to_list(row: &FileOrigin) {
     let result = crate::config::Config::default_data_dir()
         .map_err(|error| anyhow::anyhow!("{:#}", error))
         .and_then(|data_dir| Database::init(&data_dir))
-        .and_then(|db| db.add_list_entry(&config.list_mode, &row.process_path, false));
+        .and_then(|db| db.add_list_entry(&config.list_mode, process_path, false));
 
-    let window = HWND(HISTORY_WINDOW.load(Ordering::SeqCst) as *mut c_void);
     match result {
         Ok(()) => {
             log::info!(
                 "[名单] 已把 {} 加入{}",
-                row.process_path,
+                process_path,
                 config.list_mode_name()
             );
             let text = wide(&format!(
                 "已把下面这个程序加入{}：\n\n{}\n\n名单可以在托盘菜单的「名单管理」里查看和移除。",
                 config.list_mode_name(),
-                row.process_path
+                process_path
             ));
             let title = wide("文件来源追踪");
             unsafe {
                 let _ = MessageBoxW(
-                    window,
+                    owner,
                     PCWSTR(text.as_ptr()),
                     PCWSTR(title.as_ptr()),
                     MB_OK | MB_ICONINFORMATION,
@@ -1361,41 +1262,56 @@ fn add_program_to_list(row: &FileOrigin) {
 ///
 /// 备注按「程序完整路径」保存：同一个程序以后产生的每条记录都会带上它；
 /// 输入空内容表示删除这条备注。
-fn edit_program_note(row: &FileOrigin) {
-    let owner = HWND(HISTORY_WINDOW.load(Ordering::SeqCst) as *mut c_void);
-
+///
+/// `owner` 是备注窗口的父窗口；`process_name / process_path / note` 来自
+/// 当前右键选中的记录或程序汇总行，因此「最近记录」和「程序统计」两个窗口
+/// 都能复用这套逻辑。
+///
+/// 只有真正保存成功时才返回 `true`（用户点取消、写库失败都返回 `false`），
+/// 调用方可以据此决定是否需要刷新自己的列表。
+pub(crate) fn edit_program_note(
+    owner: HWND,
+    process_name: &str,
+    process_path: &str,
+    note: &str,
+) -> bool {
     // 弹出模态窗口；用户点“取消”时返回 None，直接结束。
-    let Some(note) = crate::note::show(owner, &row.process_name, &row.process_path, &row.note)
-    else {
-        return;
+    let Some(note) = crate::note::show(owner, process_name, process_path, note) else {
+        return false;
     };
 
     // 记录窗口用的是只读连接，写备注必须另开一个可写连接。
     let result = crate::config::Config::default_data_dir()
         .map_err(|error| anyhow::anyhow!("{:#}", error))
         .and_then(|data_dir| Database::init(&data_dir))
-        .and_then(|db| db.set_program_note(&row.process_path, &note));
+        .and_then(|db| db.set_program_note(process_path, &note));
 
     match result {
         Ok(()) => {
             log::info!(
                 "[记录] 程序备注已保存：{} -> {}",
-                row.process_path,
+                process_path,
                 if note.is_empty() {
                     "（已清除）"
                 } else {
                     note.as_str()
                 }
             );
-            // 立刻刷新列表：同一个程序的其它记录也要马上显示新备注。
+            // 立刻刷新记录列表：同一个程序的其它记录也要马上显示新备注。
             refresh_list();
+            true
         }
-        Err(error) => log::error!("[记录] 保存程序备注失败：{:#}", error),
+        Err(error) => {
+            log::error!("[记录] 保存程序备注失败：{:#}", error);
+            false
+        }
     }
 }
 
 /// 把文本复制到剪贴板（Unicode 文本）。
-fn copy_to_clipboard(text: &str) {
+///
+/// 「程序统计」窗口的右键菜单也会用到，所以是 crate 内公开的。
+pub(crate) fn copy_to_clipboard(text: &str) {
     let utf16 = wide(text);
     let bytes = utf16.len() * 2;
 

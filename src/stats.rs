@@ -15,9 +15,13 @@
 //! - 同一个程序可以同时展开多个类型，明细按列顺序排列
 //! - 双击「程序」列 → 收起这个程序的所有明细
 //! - 双击明细行 → 打开该文件所在目录
-//! - 在程序行上右键 → 删除该程序的全部记录
-//! - 在程序行的某个计数单元格上右键 → 删除该程序这一类型的全部记录
-//! - 在明细行上右键 → 删除这一条记录（都会先弹确认框）
+//! - 在程序行 / 明细行上右键 → 与「最近记录」窗口一致的记录操作：
+//!   打开文件路径、复制词条、打开创建程序所在目录、设置程序备注、加入名单
+//!   （「打开文件路径」「复制词条」只在明细行上提供，程序行没有具体文件路径）
+//! - 右键菜单底部保留删除功能：
+//!   - 在程序行上右键 → 删除该程序的全部记录
+//!   - 在程序行的某个计数单元格上右键 → 删除该程序这一类型的全部记录
+//!   - 在明细行上右键 → 删除这一条记录（都会先弹确认框）
 //! - 点击列头排序，再点一次切换升序 / 降序
 //!
 //! 性能方面的考虑与「最近记录」窗口一致：
@@ -43,18 +47,18 @@ use windows::Win32::UI::Controls::{
     LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
     LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
     LVM_SUBITEMHITTEST, LVNI_SELECTED, LVN_COLUMNCLICK, LVN_ITEMACTIVATE, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_EX_INFOTIP, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, NMHDR, NMLISTVIEW, NM_RCLICK,
+    LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_EX_INFOTIP, LVS_EX_TWOCLICKACTIVATE, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMLISTVIEW, NM_RCLICK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetClientRect, GetCursorPos,
     InsertMenuW, KillTimer, LoadCursorW, MessageBoxW, MoveWindow, PostMessageW, RegisterClassExW,
-    SendMessageW, SetForegroundWindow, SetTimer, ShowWindow, TrackPopupMenu, ICON_BIG, ICON_SMALL,
-    IDC_ARROW, IDYES, MB_ICONWARNING, MB_YESNO, MF_BYPOSITION, MF_STRING, SW_HIDE, SW_SHOWNORMAL,
-    TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC, WM_NOTIFY, WM_NULL,
-    WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    SendMessageW, SetForegroundWindow, SetTimer, ShowWindow, TrackPopupMenu, HMENU, ICON_BIG,
+    ICON_SMALL, IDC_ARROW, IDYES, MB_ICONWARNING, MB_YESNO, MF_BYPOSITION, MF_SEPARATOR,
+    MF_STRING, SW_HIDE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC,
+    WM_NOTIFY, WM_NULL, WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSEXW,
+    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::db::{Database, FileOrigin, ProgramStat};
@@ -116,6 +120,14 @@ const MENU_DELETE_PROGRAM: u32 = 5001;
 const MENU_DELETE_RECORD: u32 = 5002;
 /// 右键菜单命令 ID：删除某个程序的某一类动作的全部记录。
 const MENU_DELETE_ACTION: u32 = 5003;
+
+/// 以下命令从「最近记录」窗口的右键菜单移植过来。
+/// 命令 ID 与那边的 4001~4005 错开，避免两个窗口互相干扰。
+const MENU_OPEN_PATH: u32 = 5011;
+const MENU_COPY_ENTRY: u32 = 5012;
+const MENU_OPEN_PROGRAM_DIR: u32 = 5013;
+const MENU_SET_NOTE: u32 = 5014;
+const MENU_ADD_TO_LIST: u32 = 5015;
 
 /// WM_VSCROLL：标准垂直滚动消息（重建列表后用来滚回原来的位置）。
 const WM_VSCROLL: u32 = 0x0115;
@@ -263,6 +275,42 @@ unsafe extern "system" fn window_procedure(
                 MENU_DELETE_PROGRAM => delete_program_command(hwnd),
                 MENU_DELETE_RECORD => delete_record_command(hwnd),
                 MENU_DELETE_ACTION => delete_action_command(hwnd),
+                // ---- 以下是从「最近记录」窗口移植过来的记录操作 ----
+                // 「打开文件路径」「复制词条」需要具体文件路径，只对明细行有效。
+                MENU_OPEN_PATH => {
+                    if let Some(StatsRow::Detail { record, .. }) = context_row() {
+                        crate::history::open_path_target(&record);
+                    }
+                }
+                MENU_COPY_ENTRY => {
+                    if let Some(StatsRow::Detail { record, .. }) = context_row() {
+                        crate::history::copy_to_clipboard(&record.file_path);
+                    }
+                }
+                // 程序级操作：程序汇总行和明细行都带着创建程序信息，两种行都可用。
+                MENU_OPEN_PROGRAM_DIR => {
+                    if let Some((_, process_path, _)) = context_program() {
+                        crate::util::reveal_in_explorer(&process_path);
+                    }
+                }
+                MENU_SET_NOTE => {
+                    if let Some((process_name, process_path, note)) = context_program() {
+                        if crate::history::edit_program_note(
+                            hwnd,
+                            &process_name,
+                            &process_path,
+                            &note,
+                        ) {
+                            // 备注直接显示在「程序」列，保存成功后重读统计。
+                            refresh_stats(true);
+                        }
+                    }
+                }
+                MENU_ADD_TO_LIST => {
+                    if let Some((_, process_path, _)) = context_program() {
+                        crate::history::add_program_to_list(hwnd, &process_path);
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -389,7 +437,13 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     SendMessageW(list, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
 
     // 整行选中 + 网格线 + 双缓冲 + 长文本悬停提示（路径太长时用得上）。
-    let extended = LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER | LVS_EX_INFOTIP;
+    // LVS_EX_TWOCLICKACTIVATE：双击时才会发送 LVN_ITEMACTIVATE，
+    // 没有这个扩展样式，双击展开明细完全不会触发。
+    let extended = LVS_EX_FULLROWSELECT
+        | LVS_EX_GRIDLINES
+        | LVS_EX_DOUBLEBUFFER
+        | LVS_EX_INFOTIP
+        | LVS_EX_TWOCLICKACTIVATE;
     SendMessageW(
         list,
         LVM_SETEXTENDEDLISTVIEWSTYLE,
@@ -686,12 +740,17 @@ fn cached_row(index: usize) -> Option<StatsRow> {
     }
 }
 
-/// 在右键位置弹出记录操作菜单。
+/// 在右键位置弹出操作菜单。
 ///
-/// 菜单内容随「行 + 列」变化：
-/// - 程序行的某个计数单元格：删除该程序这一类型的全部记录
-/// - 程序行的程序名 / 合计列：删除该程序的全部记录
-/// - 明细行：删除这一条记录
+/// 菜单分两部分：
+/// 1. 「最近记录」窗口里那组记录操作（打开路径 / 复制词条 / 打开程序目录 /
+///    设置备注 / 加入名单）；
+/// 2. 删除操作，内容随「行 + 列」变化：
+///    - 程序行的某个计数单元格：删除该程序这一类型的全部记录
+///    - 程序行的程序名 / 合计列：删除该程序的全部记录
+///    - 明细行：删除这一条记录
+///
+/// 「打开文件路径」「复制词条」只对明细行提供，因为程序汇总行没有具体文件路径。
 unsafe fn show_row_menu(window: HWND, index: usize, sub_item: i32) {
     let Some(row) = cached_row(index) else {
         return;
@@ -699,44 +758,71 @@ unsafe fn show_row_menu(window: HWND, index: usize, sub_item: i32) {
     CONTEXT_ROW.store(index as isize, Ordering::SeqCst);
     CONTEXT_SUBITEM.store(sub_item as isize, Ordering::SeqCst);
 
-    let (command, text) = match &row {
-        StatsRow::Detail { .. } => (MENU_DELETE_RECORD, "删除这条记录".to_string()),
-        StatsRow::Program(stat) => {
-            if (1..=5).contains(&sub_item) {
-                let action = ACTION_COLUMNS[(sub_item - 1) as usize];
-                // 该类型没有任何记录时不必弹菜单（删了也是 0 条）。
-                if stat.count_of(action) <= 0 {
-                    return;
-                }
-                (
-                    MENU_DELETE_ACTION,
-                    format!(
-                        "删除「{}」的全部{}记录",
-                        stat.process_name,
-                        action_label(action)
-                    ),
-                )
-            } else {
-                (
-                    MENU_DELETE_PROGRAM,
-                    format!("删除「{}」的全部记录", stat.process_name),
-                )
-            }
-        }
-    };
-
     let Ok(menu) = CreatePopupMenu() else {
         return;
     };
 
-    let text = wide(&text);
-    let _ = InsertMenuW(
+    // ---- 第一部分：移植过来的记录操作 ----
+    let mut position: u32 = 0;
+    if matches!(row, StatsRow::Detail { .. }) {
+        append_menu_item(menu, position, MENU_OPEN_PATH, "打开文件路径");
+        position += 1;
+        append_menu_item(menu, position, MENU_COPY_ENTRY, "复制词条");
+        position += 1;
+    }
+    append_menu_item(menu, position, MENU_OPEN_PROGRAM_DIR, "打开创建程序所在目录");
+    position += 1;
+    append_menu_item(menu, position, MENU_SET_NOTE, "设置程序备注…");
+    position += 1;
+    append_menu_item(
         menu,
-        0,
-        MF_BYPOSITION | MF_STRING,
-        command as usize,
-        PCWSTR(text.as_ptr()),
+        position,
+        MENU_ADD_TO_LIST,
+        crate::history::menu_add_to_list_text(),
     );
+    position += 1;
+
+    // ---- 第二部分：原有的删除操作，用分隔线和上面隔开 ----
+    let delete_item = match &row {
+        StatsRow::Detail { .. } => {
+            Some((MENU_DELETE_RECORD, "删除这条记录".to_string()))
+        }
+        StatsRow::Program(stat) => {
+            if (1..=5).contains(&sub_item) {
+                let action = ACTION_COLUMNS[(sub_item - 1) as usize];
+                // 该类型没有任何记录时不必显示删除项（删了也是 0 条）。
+                if stat.count_of(action) <= 0 {
+                    None
+                } else {
+                    Some((
+                        MENU_DELETE_ACTION,
+                        format!(
+                            "删除「{}」的全部{}记录",
+                            stat.process_name,
+                            action_label(action)
+                        ),
+                    ))
+                }
+            } else {
+                Some((
+                    MENU_DELETE_PROGRAM,
+                    format!("删除「{}」的全部记录", stat.process_name),
+                ))
+            }
+        }
+    };
+
+    if let Some((command, text)) = delete_item {
+        let _ = InsertMenuW(menu, position, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
+        let text = wide(&text);
+        let _ = InsertMenuW(
+            menu,
+            position + 1,
+            MF_BYPOSITION | MF_STRING,
+            command as usize,
+            PCWSTR(text.as_ptr()),
+        );
+    }
 
     let mut point = POINT::default();
     if GetCursorPos(&mut point).is_err() {
@@ -760,6 +846,20 @@ unsafe fn show_row_menu(window: HWND, index: usize, sub_item: i32) {
     let _ = PostMessageW(window, WM_NULL, WPARAM(0), LPARAM(0));
 }
 
+/// 在菜单末尾追加一个普通字符串菜单项。
+///
+/// `position` 用「按位置插入」的方式指定顺序，调用方按 0、1、2… 递增即可。
+unsafe fn append_menu_item(menu: HMENU, position: u32, command: u32, text: &str) {
+    let text = wide(text);
+    let _ = InsertMenuW(
+        menu,
+        position,
+        MF_BYPOSITION | MF_STRING,
+        command as usize,
+        PCWSTR(text.as_ptr()),
+    );
+}
+
 /// 右键菜单当前针对的行。
 fn context_row() -> Option<StatsRow> {
     let index = CONTEXT_ROW.load(Ordering::SeqCst);
@@ -767,6 +867,19 @@ fn context_row() -> Option<StatsRow> {
         return None;
     }
     cached_row(index as usize)
+}
+
+/// 右键菜单当前针对的「创建程序」信息：（程序名、程序路径、备注）。
+///
+/// 程序汇总行和明细行都带着这三项，所以「打开创建程序所在目录」
+/// 「设置程序备注」「加入名单」对两种行都可用。
+fn context_program() -> Option<(String, String, String)> {
+    match context_row()? {
+        StatsRow::Program(stat) => Some((stat.process_name, stat.process_path, stat.note)),
+        StatsRow::Detail { record, .. } => {
+            Some((record.process_name, record.process_path, record.note))
+        }
+    }
 }
 
 /// 弹出「是 / 否」确认框，返回用户是否点了「是」。
