@@ -12,9 +12,8 @@
 //! - 「类型」列按记录种类显示彩色底：新建文件=天蓝、新建文件夹=青绿、
 //!   修改文件=浅紫、删除文件=红、删除文件夹=橙
 //! - 双击「创建程序」列打开程序所在目录，双击「路径」列打开文件所在目录
-//!
-//! 注意：记录操作（打开路径 / 复制词条 / 打开程序目录 / 设置备注 / 加入名单）
-//! 已统一放到「程序统计」窗口的右键菜单，这里不再提供右键菜单。
+//! - 右键点击任意一行：打开文件路径 / 复制词条 / 打开创建程序所在目录 /
+//!   设置程序备注 / 加入名单（与「程序统计」窗口的右键菜单保持一致）
 
 use anyhow::Result;
 use once_cell::sync::Lazy;
@@ -43,17 +42,19 @@ use windows::Win32::UI::Controls::{
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST,
     LVNI_SELECTED, LVN_COLUMNCLICK, LVN_ITEMACTIVATE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
     LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMLISTVIEW,
-    NMLVCUSTOMDRAW, NM_CUSTOMDRAW,
+    NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_RCLICK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW,
-    GetWindowTextW, KillTimer, LoadCursorW, MessageBoxW, MoveWindow, RegisterClassExW, SendMessageW,
-    SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK,
-    BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL,
-    IDC_ARROW, MB_ICONINFORMATION, MB_OK, MSG, SW_HIDE, SW_SHOWNORMAL, WA_INACTIVE,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT,
-    WM_CTLCOLORSTATIC, WM_NOTIFY, WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER,
-    WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetClientRect,
+    GetCursorPos, GetMessageW, GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MessageBoxW,
+    MoveWindow, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
+    ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
+    BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW,
+    MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL,
+    TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_NOTIFY,
+    WM_NULL, WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER,
+    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::db::{Database, FileOrigin};
@@ -101,6 +102,12 @@ static SORT_COLUMN: AtomicIsize = AtomicIsize::new(0);
 static SORT_ASCENDING: AtomicBool = AtomicBool::new(false);
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
+/// 右键菜单当前针对的行号（-1 表示没有）。
+///
+/// 菜单弹出后窗口过程会收到 WM_COMMAND，此时鼠标早已离开，
+/// 只能靠这个变量记住「用户是右键点了哪一行」。
+static CONTEXT_ROW: AtomicIsize = AtomicIsize::new(-1);
+
 /// 列表的列定义：（标题，宽度）。顺序必须和填充数据时使用的列下标一致。
 ///
 /// 双击 / 右键时也用它按光标 x 坐标反推用户点的是哪一列，比依赖
@@ -128,6 +135,17 @@ const FILTER_START_ENABLE_ID: usize = 6;
 const FILTER_END_ENABLE_ID: usize = 7;
 /// 顶部工具栏右侧的「程序统计」按钮。
 const STATS_BUTTON_ID: usize = 8;
+
+/// 右键菜单命令 ID。
+///
+/// 这些 ID 只在本窗口的消息循环里使用，和「程序统计」窗口的 5001~5015、
+/// 「关于」窗口的 4001~4002 各自独立，不会互相干扰
+/// （它们分属不同的顶层窗口，消息不会串）。
+const MENU_OPEN_PATH: u32 = 4001;
+const MENU_COPY_ENTRY: u32 = 4002;
+const MENU_OPEN_PROGRAM_DIR: u32 = 4003;
+const MENU_SET_NOTE: u32 = 4004;
+const MENU_ADD_TO_LIST: u32 = 4005;
 
 /// 日期时间框的值变化通知码（winuser.h 里的 DTN_DATETIMECHANGE = 0U-759U）。
 const DTN_DATETIMECHANGE_CODE: u32 = 0xFFFF_FD09;
@@ -305,6 +323,45 @@ unsafe extern "system" fn window_procedure(
                 _ if id == FILTER_START_ENABLE_ID as u32 || id == FILTER_END_ENABLE_ID as u32 => {
                     reload_list();
                 }
+                // ---- 右键菜单命令 ----
+                // 打开当前记录指向的文件 / 文件夹所在位置。
+                _ if id == MENU_OPEN_PATH => {
+                    if let Some(row) = context_row() {
+                        open_path_target(&row);
+                    }
+                }
+                // 把当前记录的文件路径复制到剪贴板。
+                _ if id == MENU_COPY_ENTRY => {
+                    if let Some(row) = context_row() {
+                        copy_to_clipboard(&row.file_path);
+                    }
+                }
+                // 打开「创建程序」所在目录并选中程序文件。
+                _ if id == MENU_OPEN_PROGRAM_DIR => {
+                    if let Some(row) = context_row() {
+                        crate::util::reveal_in_explorer(&row.process_path);
+                    }
+                }
+                // 编辑该「创建程序」的备注。备注按程序路径保存到数据库，
+                // 因此「程序统计」窗口看到的也是同一个备注（两边天然同步）。
+                _ if id == MENU_SET_NOTE => {
+                    if let Some(row) = context_row() {
+                        // 保存成功时 `edit_program_note` 内部已经刷新本窗口，
+                        // 并会通知统计窗口一起刷新，这里不用再做额外处理。
+                        crate::history::edit_program_note(
+                            hwnd,
+                            &row.process_name,
+                            &row.process_path,
+                            &row.note,
+                        );
+                    }
+                }
+                // 把该「创建程序」加入黑 / 白名单。
+                _ if id == MENU_ADD_TO_LIST => {
+                    if let Some(row) = context_row() {
+                        add_program_to_list(hwnd, &row.process_path);
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -357,6 +414,13 @@ unsafe extern "system" fn window_procedure(
                         let info = &*(lparam.0 as *const NMLISTVIEW);
                         toggle_sort(info.iSubItem);
                         apply_filter(false);
+                    }
+                    NM_RCLICK => {
+                        // 右键：先选中该行（让用户看清菜单针对哪条记录），再弹出菜单。
+                        if let Some((index, _)) = hit_test_item(list) {
+                            select_row(list, index);
+                            show_row_menu(hwnd, index);
+                        }
                     }
                     NM_CUSTOMDRAW => {
                         // 自定义绘制：只为「类型」列刷彩色背景，其它列保持系统默认绘制。
@@ -782,6 +846,75 @@ fn cached_row(index: usize) -> Option<FileOrigin> {
         Ok(cache) => cache.get(index).cloned(),
         Err(poisoned) => poisoned.into_inner().get(index).cloned(),
     }
+}
+
+/// 右键菜单当前针对的记录（右键点中的那一行）。
+fn context_row() -> Option<FileOrigin> {
+    let index = CONTEXT_ROW.load(Ordering::SeqCst);
+    if index < 0 {
+        return None;
+    }
+    cached_row(index as usize)
+}
+
+/// 弹出记录行的右键菜单。
+///
+/// 菜单共五项，与「程序统计」窗口保持一致：
+/// 打开文件路径 / 复制词条 / 打开创建程序所在目录 / 设置程序备注 / 加入名单。
+///
+/// 之所以用 `InsertMenuW` 按位置逐个插入，而不是一次性构造菜单，
+/// 是因为「加入名单」的文字要按当前名单模式动态生成（黑名单 / 白名单）。
+unsafe fn show_row_menu(window: HWND, index: usize) {
+    // 行号可能因为定时刷新而失效，先确认缓存里确实有这条记录。
+    if cached_row(index).is_none() {
+        return;
+    }
+    CONTEXT_ROW.store(index as isize, Ordering::SeqCst);
+
+    let Ok(menu) = CreatePopupMenu() else {
+        return;
+    };
+
+    // 前四项是固定文字。
+    insert_menu_text(menu, 0, MENU_OPEN_PATH, "打开文件路径");
+    insert_menu_text(menu, 1, MENU_COPY_ENTRY, "复制词条");
+    insert_menu_text(menu, 2, MENU_OPEN_PROGRAM_DIR, "打开创建程序所在目录");
+    insert_menu_text(menu, 3, MENU_SET_NOTE, "设置程序备注…");
+    // 最后一项随名单模式变化。
+    insert_menu_text(menu, 4, MENU_ADD_TO_LIST, menu_add_to_list_text());
+
+    let mut point = POINT::default();
+    if GetCursorPos(&mut point).is_err() {
+        let _ = DestroyMenu(menu);
+        return;
+    }
+
+    // TrackPopupMenu 要求窗口在前台，否则点菜单外面菜单不会消失。
+    let _ = SetForegroundWindow(window);
+    let _ = TrackPopupMenu(
+        menu,
+        TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+        point.x,
+        point.y,
+        0,
+        window,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+    // 让菜单正常关闭（Windows 官方示例里的做法）。
+    let _ = PostMessageW(window, WM_NULL, WPARAM(0), LPARAM(0));
+}
+
+/// 在菜单的指定位置插入一个普通字符串菜单项。
+unsafe fn insert_menu_text(menu: HMENU, position: u32, command: u32, text: &str) {
+    let text = wide(text);
+    let _ = InsertMenuW(
+        menu,
+        position,
+        MF_BYPOSITION | MF_STRING,
+        command as usize,
+        PCWSTR(text.as_ptr()),
+    );
 }
 
 /// 打开记录里的文件 / 文件夹所在位置。
@@ -1299,6 +1432,9 @@ pub(crate) fn edit_program_note(
             );
             // 立刻刷新记录列表：同一个程序的其它记录也要马上显示新备注。
             refresh_list();
+            // 备注是存在数据库里、按程序共享的，顺手通知「程序统计」窗口刷新，
+            // 这样两个页面始终显示同一份备注（统计窗口没打开时该调用无副作用）。
+            crate::stats::refresh_external();
             true
         }
         Err(error) => {

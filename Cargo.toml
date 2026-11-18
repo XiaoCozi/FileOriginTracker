@@ -1,6 +1,6 @@
 [package]
 name = "file-origin-tracker"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 authors = ["FileOriginTracker"]
 description = "后台追踪文件/文件夹来自哪个程序创建的 Windows 系统工具"

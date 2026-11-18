@@ -558,6 +558,21 @@ fn load_all_details(process_path: &str) -> Vec<FileOrigin> {
 
 /// 后台定时刷新。
 ///
+/// 供其它窗口调用：如果统计窗口已经打开，立即按数据库里的最新数据刷新一次。
+///
+/// 典型场景是「最近记录」窗口改了程序备注——备注存在数据库里，
+/// 统计窗口只要重读数据就能看到，不需要两个窗口互相传值。
+///
+/// 窗口还没创建过（从未打开过）时什么也不做，避免在空句柄上操作控件。
+pub(crate) fn refresh_external() {
+    if STATS_WINDOW.load(Ordering::SeqCst) == 0 || LIST_VIEW.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    // 备注变化会体现在 ProgramStat 的 note 字段里，`refresh_stats` 比对到
+    // 数据不同就会自动重建列表，因此这里直接调用即可。
+    refresh_stats(true);
+}
+
 /// 汇总数据没有变化就直接返回：这样用户正在看某一屏幕的统计时，
 /// 列表不会每 10 秒闪一下、也不会被弹回顶部。
 fn refresh_stats(keep_scroll: bool) {
