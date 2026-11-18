@@ -2,8 +2,10 @@
 name = "file-origin-tracker"
 version = "0.1.11"
 edition = "2021"
-authors = ["FileOriginTracker"]
+authors = ["葱籽"]
 description = "后台追踪文件/文件夹来自哪个程序创建的 Windows 系统工具"
+license = "MIT"
+repository = "https://github.com/XiaoCozi/FileOriginTracker"
 
 # lib 同时生成 rlib（给主程序链接）和 cdylib（右键菜单扩展 DLL）
 [lib]
