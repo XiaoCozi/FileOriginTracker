@@ -69,6 +69,8 @@ const ID_BLACKLIST_RADIO: usize = 2010;
 const ID_WHITELIST_RADIO: usize = 2011;
 /// 打开名单管理窗口。
 const ID_MANAGE_LIST_BUTTON: usize = 2012;
+/// 打开「关于」对话框。
+const ID_ABOUT_BUTTON: usize = 2015;
 
 /// 开机自启使用的注册表位置：当前用户登录时自动运行。
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -179,6 +181,11 @@ unsafe extern "system" fn window_procedure(
                     if let Err(error) = crate::list_window::show() {
                         log::error!("打开名单管理窗口失败：{:#}", error);
                     }
+                    LRESULT(0)
+                }
+                ID_ABOUT_BUTTON => {
+                    // 弹出「关于」对话框（模态，直到用户关闭才返回）。
+                    crate::about::show(hwnd);
                     LRESULT(0)
                 }
                 _ => DefWindowProcW(hwnd, message, wparam, lparam),
@@ -533,7 +540,22 @@ unsafe fn create_controls(window: HWND) {
         font,
     );
 
-    // ---- 底部按钮：靠右排列，符合 Windows 习惯 ----
+    // ---- 底部按钮：从左到右依次是「关于」「保存」「关闭」，符合 Windows 习惯 ----
+    set_font(
+        create_control(
+            WINDOW_EX_STYLE::default(),
+            "BUTTON",
+            "关于",
+            button_style,
+            204,
+            580,
+            100,
+            32,
+            window,
+            ID_ABOUT_BUTTON,
+        ),
+        font,
+    );
     set_font(
         create_control(
             WINDOW_EX_STYLE::default(),

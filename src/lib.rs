@@ -6,6 +6,7 @@
 //!
 //! 两个产物共用同一份 SQLite 数据库，因此把配置和数据库代码放在这里。
 
+pub mod about;
 pub mod com;
 pub mod config;
 pub mod db;
