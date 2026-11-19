@@ -13,18 +13,22 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    HGDIOBJ, HDC, HFONT, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
+    InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
     CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, OUT_DEFAULT_PRECIS, TRANSPARENT,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, WM_ERASEBKGND, WM_PAINT,
+    DT_VCENTER, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
+use windows::Win32::UI::Controls::{
+    HDF_SORTDOWN, HDF_SORTUP, HDITEMW, HDI_FORMAT, HDI_TEXT, HDM_GETITEMCOUNT, HDM_GETITEMRECT,
+    HDM_GETITEMW, LVM_GETHEADER,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, SendMessageW, WM_ERASEBKGND, WM_PAINT, WM_PRINTCLIENT,
+};
 
 use crate::util::wide;
 
@@ -190,7 +194,8 @@ pub unsafe fn draw_text(
 /// - 普通按钮：浅灰底 + 细描边
 /// - 主按钮（`primary = true`）：强调色实心底 + 白字
 /// - 按下：边框变成强调色；禁用：灰字
-pub unsafe fn draw_button(info: &DRAWITEMSTRUCT, label: &str, primary: bool) {    let rect = info.rcItem;
+pub unsafe fn draw_button(info: &DRAWITEMSTRUCT, label: &str, primary: bool) {
+    let rect = info.rcItem;
     let pressed = info.itemState.0 & 0x0001 != 0; // ODS_SELECTED
     let disabled = info.itemState.0 & 0x0004 != 0; // ODS_DISABLED
 
@@ -248,7 +253,8 @@ pub unsafe fn draw_button(info: &DRAWITEMSTRUCT, label: &str, primary: bool) {  
 /// 不用再维护一份「ID → 文案」的映射表。
 pub unsafe fn draw_button_auto(info: &DRAWITEMSTRUCT, primary: bool) {
     let mut buffer = [0u16; 128];
-    let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(info.hwndItem, &mut buffer);
+    let length =
+        windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(info.hwndItem, &mut buffer);
     let label = String::from_utf16_lossy(&buffer[..length as usize]);
     draw_button(info, &label, primary);
 }
@@ -316,13 +322,14 @@ const BS_AUTORADIOBUTTON_STYLE: u32 = 5;
 const BS_CHECKBOX_STYLE: u32 = 2;
 const BS_RADIOBUTTON_STYLE: u32 = 4;
 const BS_AUTO3STATE_STYLE: u32 = 7;
-/// `BS_PUSHLIKE`：名单窗口里被画成按钮样子的单选框，保持系统外观即可。
+/// `BS_PUSHLIKE`：把单选框画成按钮样子（黑白名单窗口的「黑名单 / 白名单」）。
+/// 这类控件同样由我们自绘，选中态用强调色边框表示。
 const BS_PUSHLIKE_STYLE: u32 = 0x1000;
 
 /// 给窗口里的所有复选框 / 单选框装上几何风格外观。
 ///
-/// 在 `create_controls` 末尾调用一次即可；带有 `BS_PUSHLIKE` 的
-/// 按钮式单选框会被跳过（那类控件本身就应该是按钮形状）。
+/// 在 `create_controls` 末尾调用一次即可。按钮式的单选框（`BS_PUSHLIKE`）
+/// 会画成平面按钮，未选中有细描边、选中了换成强调色边框。
 pub unsafe fn style_children(parent: HWND) {
     let _ = windows::Win32::UI::WindowsAndMessaging::EnumChildWindows(
         parent,
@@ -331,7 +338,10 @@ pub unsafe fn style_children(parent: HWND) {
     );
 }
 
-unsafe extern "system" fn enum_child(child: HWND, _data: LPARAM) -> windows::Win32::Foundation::BOOL {
+unsafe extern "system" fn enum_child(
+    child: HWND,
+    _data: LPARAM,
+) -> windows::Win32::Foundation::BOOL {
     let mut class_name = [0u16; 32];
     let length = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(child, &mut class_name);
     let class = String::from_utf16_lossy(&class_name[..length as usize]);
@@ -343,9 +353,6 @@ unsafe extern "system" fn enum_child(child: HWND, _data: LPARAM) -> windows::Win
         child,
         windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
     ) as u32;
-    if style & BS_PUSHLIKE_STYLE != 0 {
-        return true.into();
-    }
 
     let kind = style & BS_TYPEMASK;
     if matches!(
@@ -357,6 +364,8 @@ unsafe extern "system" fn enum_child(child: HWND, _data: LPARAM) -> windows::Win
             | BS_AUTO3STATE_STYLE
     ) {
         let _ = windows::Win32::UI::Shell::SetWindowSubclass(child, Some(flat_checkbox), 1, 0);
+        // 子类化之后立刻要求整块重画一次，把控件创建时系统画的旧外观覆盖掉。
+        let _ = InvalidateRect(child, None, true);
     }
     true.into()
 }
@@ -373,9 +382,24 @@ unsafe extern "system" fn flat_checkbox(
     match message {
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
-            let device = BeginPaint(hwnd, &mut paint);
-            draw_checkbox(hwnd, device);
+            let _ = BeginPaint(hwnd, &mut paint);
+            // 关键修复：系统有时只让控件重画一小块（例如只重画文字焦点框），
+            // BeginPaint 返回的 DC 会被“更新区域”裁剪，没覆盖到的地方就会
+            // 残留系统之前画的原生勾选框，看起来像新旧图案叠在一起。
+            // 这里改用 GetDC 拿到完整客户区 DC，每次整块重画，彻底盖掉旧像素。
+            let full = GetDC(hwnd);
+            if !full.is_invalid() {
+                draw_checkbox(hwnd, full);
+                let _ = ReleaseDC(hwnd, full);
+            } else {
+                draw_checkbox(hwnd, paint.hdc);
+            }
             let _ = EndPaint(hwnd, &paint);
+            LRESULT(0)
+        }
+        WM_PRINTCLIENT => {
+            // 打印、截图等场景也会走这条消息，同样按新样式绘制。
+            draw_checkbox(hwnd, HDC(wparam.0 as *mut c_void));
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -400,10 +424,19 @@ unsafe fn draw_checkbox(hwnd: HWND, device: HDC) {
         WPARAM(0),
         LPARAM(0),
     )
-    .0
-        == 1;
+    .0 == 1;
     let enabled = windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd).as_bool();
-    let is_radio = matches!(style & BS_TYPEMASK, BS_AUTORADIOBUTTON_STYLE | BS_RADIOBUTTON_STYLE);
+
+    // 按钮式单选框（BS_PUSHLIKE）不画小方块，而是把整个控件画成一个平面按钮。
+    if style & BS_PUSHLIKE_STYLE != 0 {
+        draw_pushlike_radio(hwnd, device, &client, checked, enabled);
+        return;
+    }
+
+    let is_radio = matches!(
+        style & BS_TYPEMASK,
+        BS_AUTORADIOBUTTON_STYLE | BS_RADIOBUTTON_STYLE
+    );
 
     // 方块尺寸固定 15×15，垂直居中。
     let box_size = 15;
@@ -448,25 +481,16 @@ unsafe fn draw_checkbox(hwnd: HWND, device: HDC) {
                 box_rect.top + 8,
                 None,
             );
-            let _ = windows::Win32::Graphics::Gdi::LineTo(
-                device,
-                box_rect.left + 6,
-                box_rect.top + 11,
-            );
-            let _ = windows::Win32::Graphics::Gdi::LineTo(
-                device,
-                box_rect.left + 12,
-                box_rect.top + 4,
-            );
+            let _ =
+                windows::Win32::Graphics::Gdi::LineTo(device, box_rect.left + 6, box_rect.top + 11);
+            let _ =
+                windows::Win32::Graphics::Gdi::LineTo(device, box_rect.left + 12, box_rect.top + 4);
             SelectObject(device, previous_pen);
             let _ = DeleteObject(HGDIOBJ(pen.0));
         }
     }
 
     // 文字。
-    let mut buffer = [0u16; 160];
-    let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buffer);
-    let label = String::from_utf16_lossy(&buffer[..length as usize]);
     let mut text_rect = RECT {
         left: box_rect.right + 7,
         top: client.top,
@@ -475,10 +499,253 @@ unsafe fn draw_checkbox(hwnd: HWND, device: HDC) {
     };
     draw_text(
         device,
-        &label,
+        &control_text(hwnd),
         &mut text_rect,
         DT_LEFT.0 | DT_SINGLELINE.0 | DT_VCENTER.0,
         if enabled { TEXT } else { FAINT },
         body_font(),
     );
+}
+
+/// 读取控件自身的窗口文字。
+unsafe fn control_text(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 160];
+    let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buffer);
+    String::from_utf16_lossy(&buffer[..length as usize])
+}
+
+/// 画按钮式单选框：整块浅灰底 + 细描边，选中的那个换成强调色边框。
+unsafe fn draw_pushlike_radio(
+    hwnd: HWND,
+    device: HDC,
+    client: &RECT,
+    checked: bool,
+    enabled: bool,
+) {
+    let background = if !enabled {
+        BG
+    } else if checked {
+        ACCENT_SOFT
+    } else {
+        PANEL
+    };
+    let border = if !enabled {
+        BORDER_SOFT
+    } else if checked {
+        ACCENT
+    } else {
+        BORDER
+    };
+    fill(device, client, background);
+    frame(device, client, border);
+
+    let label = control_text(hwnd);
+    let mut text_rect = *client;
+    if checked {
+        // 选中的名单左侧放一个小色块，一眼就能看出当前选的是哪一个。
+        let size = 8;
+        let top = client.top + (client.bottom - client.top - size) / 2;
+        fill(
+            device,
+            &RECT {
+                left: client.left + 10,
+                top,
+                right: client.left + 10 + size,
+                bottom: top + size,
+            },
+            ACCENT,
+        );
+        text_rect.left += 18;
+    }
+    draw_text(
+        device,
+        &label,
+        &mut text_rect,
+        DT_CENTER_FLAGS,
+        if !enabled {
+            FAINT
+        } else if checked {
+            ACCENT
+        } else {
+            TEXT
+        },
+        body_font(),
+    );
+}
+
+// ===== 列表表头 =====
+//
+// 系统表头是灰色 3D 凸起，和几何风格不搭。这里在控件创建完成后
+// 给表头装上子类，接管它的 WM_PAINT：
+// - 整条表头铺浅灰面板色，底部一条细线
+// - 每一列用深色加粗文字，列之间画淡色分隔线
+// - 排序方向改用强调色小三角，和整体配色一致
+//
+// 点击列头排序、拖动列宽等行为仍由系统处理，我们只改外观。
+
+/// 给 ListView 的表头换上几何风格外观。
+///
+/// 在列插入完成之后调用一次即可。
+pub unsafe fn style_list_header(list: HWND) {
+    let header = SendMessageW(list, LVM_GETHEADER, WPARAM(0), LPARAM(0));
+    let header = HWND(header.0 as *mut c_void);
+    if header.0.is_null() {
+        return;
+    }
+    let _ = windows::Win32::UI::Shell::SetWindowSubclass(header, Some(flat_header), 2, 0);
+    let _ = InvalidateRect(header, None, true);
+}
+
+/// 表头子类过程：接管绘制，其余消息交回系统。
+unsafe extern "system" fn flat_header(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    match message {
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let _ = BeginPaint(hwnd, &mut paint);
+            let full = GetDC(hwnd);
+            if !full.is_invalid() {
+                draw_header(hwnd, full);
+                let _ = ReleaseDC(hwnd, full);
+            } else {
+                draw_header(hwnd, paint.hdc);
+            }
+            let _ = EndPaint(hwnd, &paint);
+            LRESULT(0)
+        }
+        WM_PRINTCLIENT => {
+            draw_header(hwnd, HDC(wparam.0 as *mut c_void));
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => windows::Win32::UI::Shell::DefSubclassProc(hwnd, message, wparam, lparam),
+    }
+}
+
+/// 绘制整条表头。
+unsafe fn draw_header(hwnd: HWND, device: HDC) {
+    let mut client = RECT::default();
+    let _ = GetClientRect(hwnd, &mut client);
+    // 先铺满面板色：最后一列右侧的空白区域也保持同一种颜色。
+    fill(device, &client, PANEL);
+
+    let count = SendMessageW(hwnd, HDM_GETITEMCOUNT, WPARAM(0), LPARAM(0)).0;
+    for index in 0..count {
+        // 查询每一列的矩形（表头客户区坐标）。
+        let mut rect = RECT::default();
+        let ok = SendMessageW(
+            hwnd,
+            HDM_GETITEMRECT,
+            WPARAM(index as usize),
+            LPARAM(&mut rect as *mut _ as isize),
+        );
+        if ok.0 == 0 {
+            continue;
+        }
+
+        // 列之间的淡色分隔线，两端留一点空隙，避免看起来像表格线。
+        fill(
+            device,
+            &RECT {
+                left: rect.right - 1,
+                top: rect.top + 5,
+                right: rect.right,
+                bottom: rect.bottom - 5,
+            },
+            BORDER_SOFT,
+        );
+
+        // 读取列标题文字。
+        let mut buffer = [0u16; 128];
+        let mut item = HDITEMW::default();
+        item.mask = HDI_TEXT;
+        item.pszText = PWSTR(buffer.as_mut_ptr());
+        item.cchTextMax = buffer.len() as i32;
+        let has_text = SendMessageW(
+            hwnd,
+            HDM_GETITEMW,
+            WPARAM(index as usize),
+            LPARAM(&mut item as *mut _ as isize),
+        )
+        .0 != 0;
+        let length = if has_text {
+            buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len())
+        } else {
+            0
+        };
+        let label = String::from_utf16_lossy(&buffer[..length]);
+
+        // 读取排序方向（如果有）。
+        let mut format_item = HDITEMW::default();
+        format_item.mask = HDI_FORMAT;
+        let has_format = SendMessageW(
+            hwnd,
+            HDM_GETITEMW,
+            WPARAM(index as usize),
+            LPARAM(&mut format_item as *mut _ as isize),
+        )
+        .0 != 0;
+        let sort_up = has_format && format_item.fmt.0 & HDF_SORTUP.0 != 0;
+        let sort_down = has_format && format_item.fmt.0 & HDF_SORTDOWN.0 != 0;
+
+        // 右侧留 18 像素给排序三角。
+        let mut text_rect = RECT {
+            left: rect.left + 8,
+            top: rect.top,
+            right: rect.right - 18,
+            bottom: rect.bottom,
+        };
+        draw_text(
+            device,
+            &label,
+            &mut text_rect,
+            DT_LEFT.0 | DT_SINGLELINE.0 | DT_VCENTER.0,
+            TEXT,
+            bold_font(),
+        );
+
+        if sort_up || sort_down {
+            draw_sort_arrow(device, &rect, sort_up);
+        }
+    }
+
+    // 底部一条细线，把表头和列表内容分开。
+    fill(
+        device,
+        &RECT {
+            left: client.left,
+            top: client.bottom - 1,
+            right: client.right,
+            bottom: client.bottom,
+        },
+        BORDER,
+    );
+}
+
+/// 在表头列右侧画一个 8×5 的排序三角（向上 = 升序）。
+unsafe fn draw_sort_arrow(device: HDC, column: &RECT, up: bool) {
+    let center_x = column.right - 11;
+    let center_y = (column.top + column.bottom) / 2;
+    // 逐行画越来越宽（或越来越窄）的色条，拼成三角形。
+    for row in 0..5 {
+        // 升序：上窄下宽（▲）；降序：上宽下窄（▼）。
+        let half = if up { row + 1 } else { 5 - row };
+        let top = center_y - 2 + row;
+        fill(
+            device,
+            &RECT {
+                left: center_x - half,
+                top,
+                right: center_x + half,
+                bottom: top + 1,
+            },
+            ACCENT,
+        );
+    }
 }

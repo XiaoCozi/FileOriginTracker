@@ -36,14 +36,14 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, BST_CHECKED, BST_UNCHECKED, CDDS_ITEMPREPAINT, CDDS_PREPAINT,
     CDDS_SUBITEM, CDRF_DODEFAULT, CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW,
-    DRAWITEMSTRUCT, ICC_LISTVIEW_CLASSES,
-    INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
-    LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
-    LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST,
-    LVNI_SELECTED, LVN_COLUMNCLICK, LVN_ITEMACTIVATE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_EX_GRIDLINES, LVS_EX_TWOCLICKACTIVATE, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
-    NMHDR, NMLISTVIEW, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_RCLICK,
+    DRAWITEMSTRUCT, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED,
+    LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_GETTOPINDEX,
+    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SUBITEMHITTEST, LVNI_SELECTED, LVN_COLUMNCLICK,
+    LVN_ITEMACTIVATE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES,
+    LVS_EX_TWOCLICKACTIVATE, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMHDR, NMLISTVIEW,
+    NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_RCLICK,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -51,8 +51,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetMessageW, GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MessageBoxW,
     MoveWindow, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
     SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK,
-    BS_AUTOCHECKBOX, BS_OWNERDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG,
-    ICON_SMALL,
+    BS_AUTOCHECKBOX, BS_OWNERDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL,
     IDC_ARROW, MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL,
     TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM,
@@ -172,32 +171,31 @@ const TYPE_COLUMN: i32 = 4;
 
 /// 「类型」列每种记录的单元格背景色。
 ///
+/// 新版几何风格不再用淡淡的粉彩色，而是和主题强调色同一路数的
+/// **高饱和实心色块 + 白色文字**：没有渐变、没有圆角，一眼就能区分。
 /// COLORREF 的字节顺序是 0x00BBGGRR（蓝、绿、红），不是常见的 RGB，
 /// 所以这里都按 BGR 写，注释里给出对应的 RGB 方便对照。
 ///
-/// - 新建文件   ：天蓝   RGB(135, 206, 235)
-/// - 新建文件夹 ：青绿   RGB(32, 178, 170)
-/// - 修改文件   ：浅紫   RGB(224, 200, 240)
-/// - 删除文件   ：红     RGB(219, 60, 71)
-/// - 删除文件夹 ：橙     RGB(255, 165, 0)
+/// - 新建文件   ：主题蓝 RGB(47, 107, 255)
+/// - 新建文件夹 ：青绿   RGB(18, 165, 148)
+/// - 修改文件   ：紫     RGB(124, 92, 252)
+/// - 删除文件   ：红     RGB(229, 72, 77)
+/// - 删除文件夹 ：橙     RGB(234, 88, 12)
 fn type_cell_color(action: &str) -> COLORREF {
     match action {
-        "create_dir" => COLORREF(0x00AA_B220),  // 青绿
-        "modify" => COLORREF(0x00F0_C8E0),      // 浅紫
-        "delete_file" => COLORREF(0x0047_3CDB), // 红
-        "delete_dir" => COLORREF(0x0000_A5FF),  // 橙
-        _ => COLORREF(0x00EB_CE87),             // 天蓝（新建文件）
+        "create_dir" => COLORREF(0x0094_A512),  // 青绿
+        "modify" => COLORREF(0x00FC_5C7C),      // 紫
+        "delete_file" => COLORREF(0x004D_48E5), // 红
+        "delete_dir" => COLORREF(0x000C_58EA),  // 橙
+        _ => COLORREF(0x00FF_6B2F),             // 主题蓝（新建文件）
     }
 }
 
 /// 单元格文字颜色。
 ///
-/// 浅色底用深灰字；「删除文件」是深红底，必须换成白字才看得清。
-fn type_cell_text_color(action: &str) -> COLORREF {
-    match action {
-        "delete_file" => COLORREF(0x00FF_FFFF), // 白
-        _ => COLORREF(0x0020_2020),             // 深灰
-    }
+/// 五种类型都是深色实心底，统一用白字保证对比度。
+fn type_cell_text_color(_action: &str) -> COLORREF {
+    COLORREF(0x00FF_FFFF) // 白
 }
 
 /// 编辑框内容变化时向父窗口发送的通知码（commctrl 之外的 Windows 标准通知）。
@@ -782,7 +780,12 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         instance,
         None,
     ) {
-        SendMessageW(export_button, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        SendMessageW(
+            export_button,
+            WM_SETFONT,
+            WPARAM(font.0 as usize),
+            LPARAM(1),
+        );
     }
 
     let list_class = wide("SysListView32");
@@ -838,6 +841,9 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
 
     // 给列头加上当前排序方向的箭头（默认时间倒序：↓）。
     update_sort_headers();
+
+    // 列头统一改成几何风格（浅灰面板 + 细线 + 强调色排序三角）。
+    crate::theme::style_list_header(list);
 
     // 底部翻页栏：「上一页」「下一页」+ 页码说明文字。
     // 位置在 resize_controls 里按窗口高度重新计算。
@@ -1310,11 +1316,7 @@ fn set_checkbox(handle: &AtomicIsize, checked: bool) {
     if hwnd.0.is_null() {
         return;
     }
-    let state = if checked {
-        BST_CHECKED
-    } else {
-        BST_UNCHECKED
-    };
+    let state = if checked { BST_CHECKED } else { BST_UNCHECKED };
     unsafe {
         SendMessageW(hwnd, BM_SETCHECK, WPARAM(state.0 as usize), LPARAM(0));
     }
@@ -1327,7 +1329,11 @@ fn set_checkbox(handle: &AtomicIsize, checked: bool) {
 fn open_time_popup(owner: HWND, control_id: usize) {
     let is_start = control_id == FILTER_START_PICKER_ID;
     let (field_handle, value_handle, enable_handle) = if is_start {
-        (&FILTER_START_FIELD, &FILTER_START_VALUE, &FILTER_START_ENABLE)
+        (
+            &FILTER_START_FIELD,
+            &FILTER_START_VALUE,
+            &FILTER_START_ENABLE,
+        )
     } else {
         (&FILTER_END_FIELD, &FILTER_END_VALUE, &FILTER_END_ENABLE)
     };
@@ -2131,4 +2137,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

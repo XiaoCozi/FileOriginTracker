@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor};
+use windows::Win32::Graphics::Gdi::{InvalidateRect, SetBkColor, SetTextColor};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::{
@@ -41,9 +41,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BS_AUTORADIOBUTTON, BS_OWNERDRAW, BS_PUSHLIKE, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW,
     MB_ICONWARNING, MB_OK, SW_HIDE, SW_SHOWNORMAL, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM,
-    WM_NOTIFY,
-    WM_SETICON, WM_SIZE, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW,
-    WS_TABSTOP, WS_VISIBLE,
+    WM_NOTIFY, WM_SETICON, WM_SIZE, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::config::Config;
@@ -325,6 +324,9 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         );
     }
 
+    // 列头统一改成几何风格（浅灰面板 + 细线 + 强调色排序三角）。
+    crate::theme::style_list_header(list);
+
     // 底部一行：添加到哪个名单 + 三个操作按钮，最后是「关闭」。
     //
     // 对齐要点（之前看起来“乱”的原因）：
@@ -339,8 +341,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     let radio_style = WINDOW_STYLE(
         WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32 | BS_PUSHLIKE as u32,
     );
-    let button_style =
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32);
+    let button_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32);
 
     let mut controls_to_style: Vec<HWND> = Vec::new();
 
@@ -494,12 +495,17 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         LPARAM(0),
     );
     update_target_text(window);
+
+    // 单选按钮（BS_PUSHLIKE）也交给全局主题画：平面按钮 + 选中态强调色边框，
+    // 不再使用系统默认的灰色凸起外观。
+    crate::theme::style_children(window);
 }
 
-/// 刷新「添加到」两个按钮上的文字：选中的那个前面加「✓」。
+/// 刷新「添加到」两个按钮的显示状态。
 ///
-/// 这两个单选框用的是按钮外观（BS_PUSHLIKE），整个按钮都能点，
-/// 但“按下”状态在小尺寸下不够明显，所以再用一个 ✓ 明确标出当前选的是哪个名单。
+/// 这两个单选框用的是按钮外观（BS_PUSHLIKE），选中状态现在由全局主题
+/// 直接画出来（强调色边框 + 左侧小色块），所以文字保持干净的名字即可；
+/// 这里负责在切换后让两个按钮都重画一次。
 unsafe fn update_target_text(window: HWND) {
     for (id, name) in [
         (TARGET_BLACK_RADIO, "黑名单"),
@@ -510,14 +516,9 @@ unsafe fn update_target_text(window: HWND) {
         if control.0.is_null() {
             continue;
         }
-        let checked = SendMessageW(control, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1;
-        let text = if checked {
-            format!("✓ {}", name)
-        } else {
-            format!("   {}", name)
-        };
-        let text = wide(&text);
+        let text = wide(name);
         let _ = SetWindowTextW(control, PCWSTR(text.as_ptr()));
+        let _ = InvalidateRect(control, None, true);
     }
 }
 

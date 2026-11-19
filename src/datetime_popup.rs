@@ -27,9 +27,9 @@ use windows::Win32::Foundation::{
     COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SYSTEMTIME, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EndPaint,
-    HGDIOBJ, HDC, PAINTSTRUCT, SRCCOPY, SelectObject, DT_CENTER, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+    EndPaint, SelectObject, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HDC, HGDIOBJ,
+    PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
@@ -38,8 +38,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     GetSystemMetrics, GetWindowRect, IsWindow, LoadCursorW, RegisterClassExW, SetForegroundWindow,
     ShowWindow, TranslateMessage, HMENU, IDC_ARROW, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOWNORMAL,
-    WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WM_ACTIVATE, WM_CLOSE, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_PAINT, WS_EX_TOOLWINDOW,
+    WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_PAINT, WNDCLASSEXW, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -56,42 +56,45 @@ const WINDOW_CLASS: &str = "FileOriginTrackerDateTimePopup";
 
 // ===== 尺寸常量（全部为像素）=====
 //
-// 窗口总体比系统日历大一圈，配合 16 像素内边距，视觉上更舒展。
-const WIDTH: i32 = 368;
-const HEIGHT: i32 = 460;
+// 浮窗整体按 9pt 正文字号重新收紧：格子、按钮和间距都缩小，
+// 和界面里其它控件（24～32 像素高）保持同一比例，不再显得“一大坨”。
+const WIDTH: i32 = 306;
+const HEIGHT: i32 = 356;
 /// 四周统一内边距。
-const PAD: i32 = 16;
+const PAD: i32 = 12;
 
 /// 月份标题那一行。
-const HEADER_Y: i32 = 16;
-const HEADER_H: i32 = 34;
+const HEADER_Y: i32 = 10;
+const HEADER_H: i32 = 28;
 
 /// 星期几标题行。
-const WEEKDAY_Y: i32 = 60;
-const WEEKDAY_H: i32 = 22;
+const WEEKDAY_Y: i32 = 42;
+const WEEKDAY_H: i32 = 18;
 
-/// 日期格子：46 宽、36 高，格子之间留 2 像素缝隙，
+/// 日期格子：38 宽、28 高，格子之间留 2 像素缝隙，
 /// 这样即使不做圆角、不用阴影，也不会糊成一片。
 const GRID_X: i32 = PAD + 1;
-const GRID_Y: i32 = 88;
-const CELL_W: i32 = 46;
-const CELL_H: i32 = 36;
+const GRID_Y: i32 = 64;
+const CELL_W: i32 = 38;
+const CELL_H: i32 = 28;
 const CELL_GAP: i32 = 2;
 
 /// 日历和时间区域之间的分隔线。
-const DIVIDER_Y: i32 = 324;
+const DIVIDER_Y: i32 = 250;
 
 /// 时间区域：「时 / 分 / 秒」标题 + 调节器。
-const TIME_LABEL_Y: i32 = 334;
-const TIME_ROW_Y: i32 = 356;
-const TIME_ROW_H: i32 = 34;
+const TIME_LABEL_Y: i32 = 256;
+const TIME_ROW_Y: i32 = 274;
+const TIME_ROW_H: i32 = 28;
 /// 每组「− 数值 +」的宽度，以及组与组之间的间隔。
-const TIME_GROUP_W: i32 = 104;
-const TIME_GROUP_GAP: i32 = 12;
+const TIME_GROUP_W: i32 = 84;
+const TIME_GROUP_GAP: i32 = 9;
+/// 「−」「+」按钮的宽度；中间的数值框自动占据剩下的空间。
+const TIME_BUTTON_W: i32 = 28;
 
 /// 底部按钮行。
-const FOOTER_Y: i32 = 408;
-const FOOTER_H: i32 = 36;
+const FOOTER_Y: i32 = 314;
+const FOOTER_H: i32 = 30;
 
 /// 虚函数键码（winuser.h），只用到这几个。
 const VK_ESCAPE: u32 = 0x1B;
@@ -651,14 +654,14 @@ fn time_hits() -> [(Hit, RECT); 6] {
             RECT {
                 left: x,
                 top: TIME_ROW_Y,
-                right: x + 30,
+                right: x + TIME_BUTTON_W,
                 bottom: TIME_ROW_Y + TIME_ROW_H,
             },
         );
         result[index * 2 + 1] = (
             *plus,
             RECT {
-                left: x + TIME_GROUP_W - 30,
+                left: x + TIME_GROUP_W - TIME_BUTTON_W,
                 top: TIME_ROW_Y,
                 right: x + TIME_GROUP_W,
                 bottom: TIME_ROW_Y + TIME_ROW_H,
@@ -670,29 +673,34 @@ fn time_hits() -> [(Hit, RECT); 6] {
 
 /// 底部三个按钮的位置。
 fn footer_hits() -> [(Hit, RECT); 3] {
+    // 三个按钮的宽度都收紧到 64～72 像素：9pt 文字足够放得下，
+    // 也不会在 306 像素宽的浮窗里互相挤到。
+    const TODAY_W: i32 = 64;
+    const BUTTON_W: i32 = 72;
+    const GAP: i32 = 8;
     [
         (
             Hit::Today,
             RECT {
                 left: PAD,
                 top: FOOTER_Y,
-                right: PAD + 80,
+                right: PAD + TODAY_W,
                 bottom: FOOTER_Y + FOOTER_H,
             },
         ),
         (
             Hit::Cancel,
             RECT {
-                left: WIDTH - PAD - 112 - 8 - 92,
+                left: WIDTH - PAD - BUTTON_W - GAP - BUTTON_W,
                 top: FOOTER_Y,
-                right: WIDTH - PAD - 112 - 8,
+                right: WIDTH - PAD - BUTTON_W - GAP,
                 bottom: FOOTER_Y + FOOTER_H,
             },
         ),
         (
             Hit::Ok,
             RECT {
-                left: WIDTH - PAD - 112,
+                left: WIDTH - PAD - BUTTON_W,
                 top: FOOTER_Y,
                 right: WIDTH - PAD,
                 bottom: FOOTER_Y + FOOTER_H,
@@ -802,9 +810,7 @@ fn weekday_of(year: i32, month: u32, day: u32) -> u32 {
         adjusted_year -= 1;
     }
     let index = (month as usize).clamp(1, 12) - 1;
-    let value = adjusted_year
-        + adjusted_year / 4
-        - adjusted_year / 100
+    let value = adjusted_year + adjusted_year / 4 - adjusted_year / 100
         + adjusted_year / 400
         + OFFSETS[index]
         + day as i32;
@@ -904,7 +910,12 @@ unsafe fn draw_all(hdc: HDC) {
     );
 
     // ---- 顶部：翻页按钮 + 年月标题 ----
-    let labels = [("«", Hit::PrevYear), ("‹", Hit::PrevMonth), ("›", Hit::NextMonth), ("»", Hit::NextYear)];
+    let labels = [
+        ("«", Hit::PrevYear),
+        ("‹", Hit::PrevMonth),
+        ("›", Hit::NextMonth),
+        ("»", Hit::NextYear),
+    ];
     for (label, hit) in labels {
         let rect = nav_hits()
             .iter()
@@ -966,13 +977,11 @@ unsafe fn draw_all(hdc: HDC) {
     for row in 0..6 {
         for column in 0..7 {
             let index = (row * 7 + column) as i32 - offset + 1;
-            let (year, month, day) =
-                resolve_cell(snapshot.view_year, snapshot.view_month, index);
+            let (year, month, day) = resolve_cell(snapshot.view_year, snapshot.view_month, index);
             let rect = cell_rect(row, column);
 
-            let selected = year == snapshot.sel_year
-                && month == snapshot.sel_month
-                && day == snapshot.sel_day;
+            let selected =
+                year == snapshot.sel_year && month == snapshot.sel_month && day == snapshot.sel_day;
             let in_view_month = year == snapshot.view_year && month == snapshot.view_month;
             let hovered = snapshot.hot == Hit::Day(row, column);
 
@@ -1065,11 +1074,11 @@ unsafe fn draw_all(hdc: HDC) {
             );
         }
 
-        // 中间数值框
+        // 中间数值框：占满两个按钮之间的空间。
         let value_rect = RECT {
-            left: group_x + 31,
+            left: group_x + TIME_BUTTON_W + 1,
             top: TIME_ROW_Y,
-            right: group_x + 73,
+            right: group_x + TIME_GROUP_W - TIME_BUTTON_W - 1,
             bottom: TIME_ROW_Y + TIME_ROW_H,
         };
         fill(hdc, &value_rect, PANEL);

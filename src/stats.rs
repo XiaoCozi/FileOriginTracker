@@ -54,8 +54,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetClientRect, GetCursorPos,
     InsertMenuW, KillTimer, LoadCursorW, MessageBoxW, MoveWindow, PostMessageW, RegisterClassExW,
     SendMessageW, SetForegroundWindow, SetTimer, ShowWindow, TrackPopupMenu, HMENU, ICON_BIG,
-    ICON_SMALL, IDC_ARROW, IDYES, MB_ICONWARNING, MB_YESNO, MF_BYPOSITION, MF_SEPARATOR,
-    MF_STRING, SW_HIDE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE,
+    ICON_SMALL, IDC_ARROW, IDYES, MB_ICONWARNING, MB_YESNO, MF_BYPOSITION, MF_SEPARATOR, MF_STRING,
+    SW_HIDE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC,
     WM_NOTIFY, WM_NULL, WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSEXW,
     WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
@@ -472,6 +472,8 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     }
 
     update_sort_headers();
+    // 列头统一改成几何风格（浅灰面板 + 细线 + 强调色排序三角）。
+    crate::theme::style_list_header(list);
     resize_controls(window, list);
 }
 
@@ -785,7 +787,12 @@ unsafe fn show_row_menu(window: HWND, index: usize, sub_item: i32) {
         append_menu_item(menu, position, MENU_COPY_ENTRY, "复制词条");
         position += 1;
     }
-    append_menu_item(menu, position, MENU_OPEN_PROGRAM_DIR, "打开创建程序所在目录");
+    append_menu_item(
+        menu,
+        position,
+        MENU_OPEN_PROGRAM_DIR,
+        "打开创建程序所在目录",
+    );
     position += 1;
     append_menu_item(menu, position, MENU_SET_NOTE, "设置程序备注…");
     position += 1;
@@ -799,9 +806,7 @@ unsafe fn show_row_menu(window: HWND, index: usize, sub_item: i32) {
 
     // ---- 第二部分：原有的删除操作，用分隔线和上面隔开 ----
     let delete_item = match &row {
-        StatsRow::Detail { .. } => {
-            Some((MENU_DELETE_RECORD, "删除这条记录".to_string()))
-        }
+        StatsRow::Detail { .. } => Some((MENU_DELETE_RECORD, "删除这条记录".to_string())),
         StatsRow::Program(stat) => {
             if (1..=5).contains(&sub_item) {
                 let action = ACTION_COLUMNS[(sub_item - 1) as usize];
@@ -828,7 +833,13 @@ unsafe fn show_row_menu(window: HWND, index: usize, sub_item: i32) {
     };
 
     if let Some((command, text)) = delete_item {
-        let _ = InsertMenuW(menu, position, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = InsertMenuW(
+            menu,
+            position,
+            MF_BYPOSITION | MF_SEPARATOR,
+            0,
+            PCWSTR::null(),
+        );
         let text = wide(&text);
         let _ = InsertMenuW(
             menu,
