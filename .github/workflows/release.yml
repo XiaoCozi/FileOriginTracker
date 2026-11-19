@@ -1,0 +1,70 @@
+name: Release
+
+# 触发方式：
+#   1. 推送 v* 标签（日常发版）
+#   2. 在 Actions 页面手动运行，填入要发布的标签（用于补发历史版本）
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的标签，例如 v0.7.2'
+        required: true
+        type: string
+
+# 创建 Release 需要写权限；GITHUB_TOKEN 由运行器自动提供，无需配置密钥。
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo 依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 编译（release）
+        shell: pwsh
+        run: cargo build --release --locked
+
+      - name: 校验标签与版本号
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          if ($tag -ne "v$version") {
+            throw "标签 $tag 与 Cargo.toml 中的版本 v$version 不一致，请先修改版本号。"
+          }
+          "value=$version" >> $env:GITHUB_OUTPUT
+
+      - name: 打包发行文件
+        shell: pwsh
+        run: ./tools/pack.ps1 -SkipBuild
+
+      - name: 创建 Release 并上传附件
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          body: |
+            ## 下载哪个版本
+
+            - `FileOriginTracker-v${{ steps.version.outputs.value }}.zip` —— 双文件版（推荐）：exe 与 dll 放在同一目录，误报率低
+            - `FileOriginTracker-single.exe` —— 单文件版：只有一个 exe，运行时自动释放 dll，可能被杀毒软件误报
+
+            > 需要管理员权限运行，用于注册资源管理器右键扩展与开启 ETW 文件监控。
+          files: |
+            dist/FileOriginTracker-v${{ steps.version.outputs.value }}.zip
+            dist/FileOriginTracker-single.exe
