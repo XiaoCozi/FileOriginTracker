@@ -318,18 +318,25 @@ pub unsafe fn draw_section(hdc: HDC, rect: &RECT, title: &str) {
 /// `BS_TYPEMASK`：取出按钮类型位，用来判断控件是复选框还是单选框。
 const BS_TYPEMASK: u32 = 0x000F;
 const BS_AUTOCHECKBOX_STYLE: u32 = 3;
-const BS_AUTORADIOBUTTON_STYLE: u32 = 5;
+const BS_AUTORADIOBUTTON_STYLE: u32 = 9;
 const BS_CHECKBOX_STYLE: u32 = 2;
 const BS_RADIOBUTTON_STYLE: u32 = 4;
-const BS_AUTO3STATE_STYLE: u32 = 7;
-/// `BS_PUSHLIKE`：把单选框画成按钮样子（黑白名单窗口的「黑名单 / 白名单」）。
-/// 这类控件同样由我们自绘，选中态用强调色边框表示。
-const BS_PUSHLIKE_STYLE: u32 = 0x1000;
+const BS_AUTO3STATE_STYLE: u32 = 6;
+/// `BS_OWNERDRAW`：改成自绘按钮后，系统不再画任何原生外观。
+const BS_OWNERDRAW_STYLE: u32 = 0x000B;
 
 /// 给窗口里的所有复选框 / 单选框装上几何风格外观。
 ///
-/// 在 `create_controls` 末尾调用一次即可。按钮式的单选框（`BS_PUSHLIKE`）
-/// 会画成平面按钮，未选中有细描边、选中了换成强调色边框。
+/// 在 `create_controls` 末尾调用一次即可。
+///
+/// 做法分两步：
+/// 1. 把控件类型改成 `BS_OWNERDRAW`。这样即使系统的原生绘制在某条
+///    路径上绕过了我们，原生勾选框也不会被画出来（owner-draw 的原生
+///    绘制是“通知父窗口去画”，自己不画），从根上避免新旧图案重叠。
+/// 2. 记住原始类型（复选框 / 单选框）并安装子类，由我们统一绘制。
+///
+/// 代价是 owner-draw 按钮不会自动切换勾选状态，所以点击后需要在父窗口的
+/// `WM_COMMAND` 里调用 [`apply_click_state`] 手动完成切换。
 pub unsafe fn style_children(parent: HWND) {
     let _ = windows::Win32::UI::WindowsAndMessaging::EnumChildWindows(
         parent,
@@ -363,11 +370,197 @@ unsafe extern "system" fn enum_child(
             | BS_RADIOBUTTON_STYLE
             | BS_AUTO3STATE_STYLE
     ) {
+        // 原始类型存进控件的 USERDATA，绘制和点击切换时都要用。
+        // 同时把系统当前的勾选状态一起打包进去：有些窗口在套用主题之前
+        // 就用 BM_SETCHECK 设置过默认选中项（例如黑白名单的单选框），
+        // 这里要把它带过来，否则转换后会显示成未选中。
+        let native_state = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            child,
+            windows::Win32::UI::WindowsAndMessaging::BM_GETCHECK,
+            WPARAM(0),
+            LPARAM(0),
+        )
+        .0 as u32
+            & 0x3;
+        windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+            child,
+            windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+            (kind | (native_state << STATE_SHIFT)) as isize,
+        );
+        // 把类型位换成 BS_OWNERDRAW，保留 WS_* 等其余样式位。
+        let new_style = (style & !BS_TYPEMASK) | BS_OWNERDRAW_STYLE;
+        windows::Win32::UI::WindowsAndMessaging::SetWindowLongW(
+            child,
+            windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+            new_style as i32,
+        );
         let _ = windows::Win32::UI::Shell::SetWindowSubclass(child, Some(flat_checkbox), 1, 0);
         // 子类化之后立刻要求整块重画一次，把控件创建时系统画的旧外观覆盖掉。
         let _ = InvalidateRect(child, None, true);
     }
     true.into()
+}
+
+/// 在父窗口的 `WM_COMMAND` 开头调用，补上 owner-draw 控件缺失的自动切换。
+///
+/// - 复选框：在「未选 / 选中」之间切换
+/// - 三态复选框：0 → 1 → 2 循环
+/// - 单选框：选中自己，并取消同一组内其它单选框
+///
+/// 只处理由 [`style_children`] 改造过的控件，其它按钮（普通按钮、菜单命令）
+/// 会原样放行，因此可以放心地在所有窗口里统一调用。
+pub unsafe fn apply_click_state(wparam: WPARAM, lparam: LPARAM) {
+    // 只处理 BN_CLICKED。
+    let notification = ((wparam.0 >> 16) & 0xFFFF) as u32;
+    if notification != windows::Win32::UI::WindowsAndMessaging::BN_CLICKED as u32 {
+        return;
+    }
+
+    let control = HWND(lparam.0 as *mut c_void);
+    if control.0.is_null() {
+        return;
+    }
+    let parent =
+        windows::Win32::UI::WindowsAndMessaging::GetParent(control).unwrap_or_default();
+    if parent.0.is_null() {
+        return;
+    }
+    let kind = stored_kind(control);
+    if kind == 0 {
+        // 不是我们改造过的控件。
+        return;
+    }
+
+    match kind {
+        BS_AUTORADIOBUTTON_STYLE | BS_RADIOBUTTON_STYLE => {
+            store_state(control, 1);
+            uncheck_other_radios(parent, control);
+        }
+        BS_AUTO3STATE_STYLE => {
+            let state = stored_state(control);
+            store_state(control, (state + 1) % 3);
+        }
+        _ => {
+            let state = stored_state(control);
+            store_state(control, if state == 1 { 0 } else { 1 });
+        }
+    }
+
+    let _ = InvalidateRect(control, None, true);
+}
+
+/// 读取一个复选框 / 单选框当前是否被选中。
+///
+/// `BS_OWNERDRAW` 按钮不支持 `BM_GETCHECK`，所以状态由主题自己保管在
+/// 控件的 USERDATA 里；业务代码统一用这个函数读取。
+pub unsafe fn is_checked(control: HWND) -> bool {
+    stored_state(control) != 0
+}
+
+/// 设置复选框 / 单选框的选中状态，并触发重画。
+pub unsafe fn set_checked(control: HWND, checked: bool) {
+    if stored_kind(control) == 0 {
+        // 没被主题改造过的普通按钮，保持系统原有行为。
+        let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            control,
+            windows::Win32::UI::WindowsAndMessaging::BM_SETCHECK,
+            WPARAM(usize::from(checked)),
+            LPARAM(0),
+        );
+        return;
+    }
+    store_state(control, u32::from(checked));
+    let _ = InvalidateRect(control, None, true);
+}
+
+/// 这个控件是否是主题接管的自绘复选框 / 单选框。
+pub unsafe fn is_themed_control(control: HWND) -> bool {
+    stored_kind(control) != 0
+}
+
+// USERDATA 打包格式：低 4 位是原始类型，第 8~9 位是勾选状态（0/1/2）。
+const STATE_SHIFT: u32 = 8;
+
+unsafe fn stored_kind(control: HWND) -> u32 {
+    let packed = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+        control,
+        windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+    ) as u32;
+    packed & BS_TYPEMASK
+}
+
+unsafe fn stored_state(control: HWND) -> u32 {
+    let packed = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+        control,
+        windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+    ) as u32;
+    (packed >> STATE_SHIFT) & 0x3
+}
+
+unsafe fn store_state(control: HWND, state: u32) {
+    let kind = stored_kind(control);
+    let packed = kind | ((state & 0x3) << STATE_SHIFT);
+    windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+        control,
+        windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+        packed as isize,
+    );
+}
+
+/// 取消同一组里其它单选框的勾选。
+///
+/// 分组规则和系统一致：从当前控件往前找到最近的 `WS_GROUP` 作为组起点，
+/// 往后遇到下一个 `WS_GROUP` 就结束。
+unsafe fn uncheck_other_radios(parent: HWND, control: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, WS_GROUP,
+    };
+
+    // 按 Z 序（也就是创建顺序）收集所有兄弟控件。
+    let mut siblings: Vec<HWND> = Vec::new();
+    let mut child =
+        windows::Win32::UI::WindowsAndMessaging::GetWindow(parent, GW_CHILD).unwrap_or_default();
+    while !child.0.is_null() {
+        siblings.push(child);
+        child = windows::Win32::UI::WindowsAndMessaging::GetWindow(child, GW_HWNDNEXT)
+            .unwrap_or_default();
+    }
+    let Some(index) = siblings.iter().position(|handle| *handle == control) else {
+        return;
+    };
+
+    // 组起点：往前找最近的 WS_GROUP 控件。
+    // WS_GROUP 标记的是“组从我开始”，所以这个带 WS_GROUP 的控件本身
+    // 也属于本组，找到后要把 start 指到它，而不是停在它的下一个。
+    let mut start = index;
+    while start > 0 {
+        start -= 1;
+        let previous_style = GetWindowLongW(siblings[start], GWL_STYLE) as u32;
+        if previous_style & WS_GROUP.0 != 0 {
+            break;
+        }
+    }
+
+    // 组终点：往后直到遇到带 WS_GROUP 的控件。
+    let mut end = index + 1;
+    while end < siblings.len() {
+        let style = GetWindowLongW(siblings[end], GWL_STYLE) as u32;
+        if style & WS_GROUP.0 != 0 {
+            break;
+        }
+        end += 1;
+    }
+
+    for sibling in &siblings[start..end] {
+        if *sibling == control {
+            continue;
+        }
+        let kind = stored_kind(*sibling);
+        if matches!(kind, BS_AUTORADIOBUTTON_STYLE | BS_RADIOBUTTON_STYLE) {
+            store_state(*sibling, 0);
+            let _ = InvalidateRect(*sibling, None, true);
+        }
+    }
 }
 
 /// 控件子类过程：只接管绘制，其余消息全部交回系统处理。
@@ -413,28 +606,24 @@ unsafe fn draw_checkbox(hwnd: HWND, device: HDC) {
     let _ = GetClientRect(hwnd, &mut client);
     fill(device, &client, BG);
 
-    // 读取控件当前状态。
-    let style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongW(
-        hwnd,
-        windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
-    ) as u32;
-    let checked = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-        hwnd,
-        windows::Win32::UI::WindowsAndMessaging::BM_GETCHECK,
-        WPARAM(0),
-        LPARAM(0),
-    )
-    .0 == 1;
+    // 读取控件当前状态（owner-draw 按钮不能用 BM_GETCHECK，从 USERDATA 读）。
+    let checked = is_checked(hwnd);
     let enabled = windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd).as_bool();
 
-    // 按钮式单选框（BS_PUSHLIKE）不画小方块，而是把整个控件画成一个平面按钮。
-    if style & BS_PUSHLIKE_STYLE != 0 {
-        draw_pushlike_radio(hwnd, device, &client, checked, enabled);
-        return;
-    }
-
+    // 控件已经被改成 BS_OWNERDRAW，类型位不再是复选框/单选框，
+    // 所以从 USERDATA 里取回改造前保存的原始类型。
+    let stored = stored_kind(hwnd);
+    let kind = if stored != 0 {
+        stored
+    } else {
+        windows::Win32::UI::WindowsAndMessaging::GetWindowLongW(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+        ) as u32
+            & BS_TYPEMASK
+    };
     let is_radio = matches!(
-        style & BS_TYPEMASK,
+        kind,
         BS_AUTORADIOBUTTON_STYLE | BS_RADIOBUTTON_STYLE
     );
 
@@ -512,65 +701,6 @@ unsafe fn control_text(hwnd: HWND) -> String {
     let mut buffer = [0u16; 160];
     let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buffer);
     String::from_utf16_lossy(&buffer[..length as usize])
-}
-
-/// 画按钮式单选框：整块浅灰底 + 细描边，选中的那个换成强调色边框。
-unsafe fn draw_pushlike_radio(
-    hwnd: HWND,
-    device: HDC,
-    client: &RECT,
-    checked: bool,
-    enabled: bool,
-) {
-    let background = if !enabled {
-        BG
-    } else if checked {
-        ACCENT_SOFT
-    } else {
-        PANEL
-    };
-    let border = if !enabled {
-        BORDER_SOFT
-    } else if checked {
-        ACCENT
-    } else {
-        BORDER
-    };
-    fill(device, client, background);
-    frame(device, client, border);
-
-    let label = control_text(hwnd);
-    let mut text_rect = *client;
-    if checked {
-        // 选中的名单左侧放一个小色块，一眼就能看出当前选的是哪一个。
-        let size = 8;
-        let top = client.top + (client.bottom - client.top - size) / 2;
-        fill(
-            device,
-            &RECT {
-                left: client.left + 10,
-                top,
-                right: client.left + 10 + size,
-                bottom: top + size,
-            },
-            ACCENT,
-        );
-        text_rect.left += 18;
-    }
-    draw_text(
-        device,
-        &label,
-        &mut text_rect,
-        DT_CENTER_FLAGS,
-        if !enabled {
-            FAINT
-        } else if checked {
-            ACCENT
-        } else {
-            TEXT
-        },
-        body_font(),
-    );
 }
 
 // ===== 列表表头 =====

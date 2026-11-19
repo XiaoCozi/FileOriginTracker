@@ -25,7 +25,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetWindowTextW, LoadCursorW, MessageBoxW, RegisterClassExW,
-    SendMessageW, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
+    SendMessageW, SetWindowTextW, ShowWindow, BS_AUTOCHECKBOX,
     BS_AUTORADIOBUTTON, BS_OWNERDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_NUMBER,
     HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW, MB_ICONWARNING, MB_OK, SW_HIDE, SW_SHOWNORMAL,
     WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE,
@@ -192,11 +192,17 @@ unsafe extern "system" fn window_procedure(
         WM_DRAWITEM => {
             // 所有普通按钮统一画成平面几何风格；「保存」是主按钮。
             let info = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+            // 自绘复选框/单选框不归这里画（它们由 theme 的子类负责）。
+            if crate::theme::is_themed_control(info.hwndItem) {
+                return LRESULT(1);
+            }
             let id = (info.CtlID & 0xFFFF) as usize;
             crate::theme::draw_button_auto(info, id == ID_SAVE_BUTTON);
             LRESULT(1)
         }
         WM_COMMAND => {
+            // 先补上自绘复选框/单选框的点击切换（owner-draw 不会自动切换）。
+            crate::theme::apply_click_state(wparam, lparam);
             match wparam.0 & 0xFFFF {
                 ID_SAVE_BUTTON => {
                     save_and_apply(hwnd);
@@ -684,66 +690,31 @@ fn load_values(window: HWND) {
         let _ = SetWindowTextW(edit, PCWSTR(text.as_ptr()));
 
         let autostart = child(window, ID_AUTOSTART_CHECK);
-        let checked = if autostart_enabled() { 1 } else { 0 };
-        SendMessageW(autostart, BM_SETCHECK, WPARAM(checked), LPARAM(0));
+        // 勾选状态统一交给主题保管（控件被改成了 owner-draw）。
+        crate::theme::set_checked(autostart, autostart_enabled());
 
         // 三个监控开关分别回填。
         // 以配置里的用户意愿为准：即使因为权限问题没启动成功，
         // 也不应该悄悄把用户的“开启”选择改成关闭。
-        let monitor_file = child(window, ID_MONITOR_FILE_CHECK);
-        SendMessageW(
-            monitor_file,
-            BM_SETCHECK,
-            WPARAM(if config.monitor_create_file { 1 } else { 0 }),
-            LPARAM(0),
+        crate::theme::set_checked(child(window, ID_MONITOR_FILE_CHECK), config.monitor_create_file);
+        crate::theme::set_checked(child(window, ID_MONITOR_DIR_CHECK), config.monitor_create_dir);
+        crate::theme::set_checked(
+            child(window, ID_MONITOR_MODIFY_CHECK),
+            config.monitor_modify_file,
         );
-
-        let monitor_dir = child(window, ID_MONITOR_DIR_CHECK);
-        SendMessageW(
-            monitor_dir,
-            BM_SETCHECK,
-            WPARAM(if config.monitor_create_dir { 1 } else { 0 }),
-            LPARAM(0),
+        crate::theme::set_checked(
+            child(window, ID_MONITOR_DELETE_FILE_CHECK),
+            config.monitor_delete_file,
         );
-
-        let monitor_modify = child(window, ID_MONITOR_MODIFY_CHECK);
-        SendMessageW(
-            monitor_modify,
-            BM_SETCHECK,
-            WPARAM(if config.monitor_modify_file { 1 } else { 0 }),
-            LPARAM(0),
-        );
-
-        let monitor_delete_file = child(window, ID_MONITOR_DELETE_FILE_CHECK);
-        SendMessageW(
-            monitor_delete_file,
-            BM_SETCHECK,
-            WPARAM(if config.monitor_delete_file { 1 } else { 0 }),
-            LPARAM(0),
-        );
-
-        let monitor_delete_dir = child(window, ID_MONITOR_DELETE_DIR_CHECK);
-        SendMessageW(
-            monitor_delete_dir,
-            BM_SETCHECK,
-            WPARAM(if config.monitor_delete_dir { 1 } else { 0 }),
-            LPARAM(0),
+        crate::theme::set_checked(
+            child(window, ID_MONITOR_DELETE_DIR_CHECK),
+            config.monitor_delete_dir,
         );
 
         // 黑白名单模式：两个单选框只能有一个选中。
         let white = config.is_white_list();
-        SendMessageW(
-            child(window, ID_BLACKLIST_RADIO),
-            BM_SETCHECK,
-            WPARAM(if white { 0 } else { 1 }),
-            LPARAM(0),
-        );
-        SendMessageW(
-            child(window, ID_WHITELIST_RADIO),
-            BM_SETCHECK,
-            WPARAM(if white { 1 } else { 0 }),
-            LPARAM(0),
-        );
+        crate::theme::set_checked(child(window, ID_BLACKLIST_RADIO), !white);
+        crate::theme::set_checked(child(window, ID_WHITELIST_RADIO), white);
     }
 }
 
@@ -957,7 +928,8 @@ fn read_check(window: HWND, id: usize) -> bool {
     if control.0.is_null() {
         return false;
     }
-    unsafe { SendMessageW(control, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1 }
+    // 勾选状态由主题保管（owner-draw 控件不能用 BM_GETCHECK）。
+    unsafe { crate::theme::is_checked(control) }
 }
 
 fn show_warning(text: &str) {

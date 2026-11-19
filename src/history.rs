@@ -34,7 +34,7 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, BST_CHECKED, BST_UNCHECKED, CDDS_ITEMPREPAINT, CDDS_PREPAINT,
+    InitCommonControlsEx, CDDS_ITEMPREPAINT, CDDS_PREPAINT,
     CDDS_SUBITEM, CDRF_DODEFAULT, CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW,
     DRAWITEMSTRUCT, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
     LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED,
@@ -50,7 +50,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetClientRect,
     GetCursorPos, GetMessageW, GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MessageBoxW,
     MoveWindow, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
-    SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK,
+    SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
     BS_AUTOCHECKBOX, BS_OWNERDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL,
     IDC_ARROW, MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL,
     TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -336,6 +336,8 @@ unsafe extern "system" fn window_procedure(
             LRESULT(0)
         }
         WM_COMMAND => {
+            // 先补上自绘复选框/单选框的点击切换（owner-draw 不会自动切换）。
+            crate::theme::apply_click_state(wparam, lparam);
             let id = (wparam.0 & 0xFFFF) as u32;
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             match id {
@@ -484,6 +486,10 @@ unsafe extern "system" fn window_procedure(
             // 这两个控件是 BS_OWNERDRAW 按钮，长什么样完全由我们决定：
             // 平面白底 + 细描边 + 右侧日历图标，和系统默认的下拉框区分开。
             let info = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            // 自绘复选框不归这里画（它们由 theme 的子类负责）。
+            if crate::theme::is_themed_control(info.hwndItem) {
+                return LRESULT(1);
+            }
             if info.CtlID as usize == FILTER_START_PICKER_ID {
                 crate::datetime_popup::draw_field(
                     info,
@@ -1255,8 +1261,8 @@ fn checkbox_checked(checkbox: &AtomicIsize) -> bool {
     if hwnd.0.is_null() {
         return false;
     }
-    let state = unsafe { SendMessageW(hwnd, BM_GETCHECK, WPARAM(0), LPARAM(0)) }.0 as u32;
-    state == BST_CHECKED.0
+    // 主题把控件改成了 owner-draw，勾选状态由 theme 统一保管。
+    unsafe { crate::theme::is_checked(hwnd) }
 }
 
 /// 读取两个时间框的当前值，得到「起 / 止」的 Unix 秒范围。
@@ -1316,9 +1322,9 @@ fn set_checkbox(handle: &AtomicIsize, checked: bool) {
     if hwnd.0.is_null() {
         return;
     }
-    let state = if checked { BST_CHECKED } else { BST_UNCHECKED };
+    // 主题把控件改成了 owner-draw，勾选状态由 theme 统一保管。
     unsafe {
-        SendMessageW(hwnd, BM_SETCHECK, WPARAM(state.0 as usize), LPARAM(0));
+        crate::theme::set_checked(hwnd, checked);
     }
 }
 

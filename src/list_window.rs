@@ -37,8 +37,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, LoadCursorW, MessageBoxW, MoveWindow,
-    RegisterClassExW, SendMessageW, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK,
-    BS_AUTORADIOBUTTON, BS_OWNERDRAW, BS_PUSHLIKE, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW,
+    RegisterClassExW, SendMessageW, SetWindowTextW, ShowWindow, BM_SETCHECK,
+    BS_AUTORADIOBUTTON, BS_OWNERDRAW, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW,
     MB_ICONWARNING, MB_OK, SW_HIDE, SW_SHOWNORMAL, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM,
     WM_NOTIFY, WM_SETICON, WM_SIZE, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE,
@@ -207,8 +207,10 @@ unsafe extern "system" fn window_procedure(
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 LRESULT(0)
             }
-            // 切换「添加到」的目标名单后，立刻更新两个按钮上的勾选标记。
+            // 切换「添加到」的目标名单。自绘单选框不会自动切换，
+            // 先由主题补上选中 / 互斥逻辑，再刷新显示。
             TARGET_BLACK_RADIO | TARGET_WHITE_RADIO => {
+                crate::theme::apply_click_state(wparam, lparam);
                 update_target_text(hwnd);
                 LRESULT(0)
             }
@@ -232,6 +234,10 @@ unsafe extern "system" fn window_procedure(
         WM_DRAWITEM => {
             // 底部操作按钮统一为平面几何风格。
             let info = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+            // 自绘复选框/单选框不归这里画（它们由 theme 的子类负责）。
+            if crate::theme::is_themed_control(info.hwndItem) {
+                return LRESULT(1);
+            }
             crate::theme::draw_button_auto(info, false);
             LRESULT(1)
         }
@@ -333,13 +339,14 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     // - 单选按钮原来只有 24px 高、比按钮低 4px，看起来高低不齐；
     // - 现在所有控件统一 32px 高、同一个 y 坐标，一眼看过去是一条直线。
     // 点击要点：
-    // - 单选框改成「按钮样式」（BS_PUSHLIKE），整个按钮区域都能点，
-    //   不用再精确点到那个小圆点上。
+    // - 单选框现在是普通「小圆点 + 文字」，点击文字也能选中。
     // 标签用 SS_CENTERIMAGE 让文字在这 32px 里垂直居中，与按钮文字对齐。
     const SS_CENTERIMAGE: u32 = 0x0200;
     let label_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | SS_CENTERIMAGE);
+    // 单选框样式：和导出条件窗口一样，用「小圆点 + 文字」的普通单选框，
+    // 视觉上更轻，和整体几何风格一致。
     let radio_style = WINDOW_STYLE(
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32 | BS_PUSHLIKE as u32,
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32,
     );
     let button_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32);
 
@@ -368,7 +375,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     );
 
     // 目标名单：黑名单（WS_GROUP 开始一组单选）/ 白名单。
-    // 用「按钮样式」的单选框，点击区域就是整个 104×32 的按钮，方便点。
+    // 使用普通小圆点单选框，和导出条件窗口保持一致；点击区域是整个控件。
     controls_to_style.push(
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -496,16 +503,14 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     );
     update_target_text(window);
 
-    // 单选按钮（BS_PUSHLIKE）也交给全局主题画：平面按钮 + 选中态强调色边框，
-    // 不再使用系统默认的灰色凸起外观。
+    // 单选框交给全局主题画：小圆点 + 文字，选中时圆点内出现强调色。
     crate::theme::style_children(window);
 }
 
-/// 刷新「添加到」两个按钮的显示状态。
+/// 刷新「添加到」两个单选框的显示状态。
 ///
-/// 这两个单选框用的是按钮外观（BS_PUSHLIKE），选中状态现在由全局主题
-/// 直接画出来（强调色边框 + 左侧小色块），所以文字保持干净的名字即可；
-/// 这里负责在切换后让两个按钮都重画一次。
+/// 选中状态由全局主题画出来（圆点内强调色），文字保持干净的名字即可；
+/// 这里负责在切换后让两个单选框都重画一次。
 unsafe fn update_target_text(window: HWND) {
     for (id, name) in [
         (TARGET_BLACK_RADIO, "黑名单"),
@@ -663,7 +668,8 @@ fn target_mode(window: HWND) -> &'static str {
         if control.0.is_null() {
             false
         } else {
-            SendMessageW(control, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1
+            // 勾选状态由主题保管（owner-draw 控件不能用 BM_GETCHECK）。
+            crate::theme::is_checked(control)
         }
     };
     if white {

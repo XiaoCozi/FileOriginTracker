@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_SETFONT,
     WNDCLASSEXW,
     WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_GROUP, WS_SYSMENU, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL, BM_GETCHECK,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::db::{Database, RecordFilter};
@@ -177,6 +177,8 @@ unsafe extern "system" fn window_procedure(
             LRESULT(0)
         }
         WM_COMMAND => {
+            // 先补上自绘复选框/单选框的点击切换（owner-draw 不会自动切换）。
+            crate::theme::apply_click_state(wparam, lparam);
             let id = (wparam.0 & 0xFFFF) as usize;
             match id {
                 // 两个单选按钮切换：决定下方筛选控件是否可用。
@@ -204,6 +206,10 @@ unsafe extern "system" fn window_procedure(
         }
         WM_DRAWITEM => {
             let info = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+            // 自绘复选框/单选框不归这里画（它们由 theme 的子类负责）。
+            if crate::theme::is_themed_control(info.hwndItem) {
+                return LRESULT(1);
+            }
             match info.CtlID as usize {
                 // 两个时间框：平面白底 + 日历图标，和其它界面一致。
                 ID_TIME_START => {
@@ -396,12 +402,8 @@ unsafe fn open_time_popup(window: HWND, id: usize) {
         ID_TIME_END_ENABLE
     };
     if let Ok(checkbox) = GetDlgItem(window, checkbox_id as i32) {
-        SendMessageW(
-            checkbox,
-            windows::Win32::UI::WindowsAndMessaging::BM_SETCHECK,
-            WPARAM(1),
-            LPARAM(0),
-        );
+        // 控件已被主题改成 owner-draw，用主题接口设置勾选状态。
+        crate::theme::set_checked(checkbox, true);
     }
 
     let _ = windows::Win32::Graphics::Gdi::InvalidateRect(field, None, true);
@@ -418,7 +420,8 @@ fn control_text(window: HWND, id: usize) -> String {
 }
 
 unsafe fn is_checked(handle: HWND) -> bool {
-    SendMessageW(handle, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1
+    // 勾选状态由主题保管（owner-draw 控件不能用 BM_GETCHECK）。
+    crate::theme::is_checked(handle)
 }
 
 /// 把 `Result<HWND>` 简化成 `Option<HWND>`。
@@ -467,12 +470,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
             SendMessageW(button, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
             // 默认选中「导出全部」。
             if id == ID_SCOPE_ALL {
-                SendMessageW(
-                    button,
-                    windows::Win32::UI::WindowsAndMessaging::BM_SETCHECK,
-                    WPARAM(1),
-                    LPARAM(0),
-                );
+                crate::theme::set_checked(button, true);
             }
         }
     }
