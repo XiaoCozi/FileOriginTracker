@@ -18,7 +18,7 @@
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{PCWSTR, PWSTR};
@@ -44,13 +44,14 @@ use windows::Win32::UI::Controls::{
     LVS_EX_GRIDLINES, LVS_EX_TWOCLICKACTIVATE, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
     NMHDR, NMLISTVIEW, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_RCLICK,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetClientRect,
     GetCursorPos, GetMessageW, GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MessageBoxW,
     MoveWindow, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
-    ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
-    BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW,
-    MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL,
+    SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK,
+    BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL,
+    IDC_ARROW, MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL,
     TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_NOTIFY,
     WM_NULL, WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER,
@@ -72,9 +73,6 @@ const WM_VSCROLL: u32 = 0x0115;
 
 /// SB_LINEDOWN：WM_VSCROLL 的 wParam 取值，表示向下滚动一行。
 const SB_LINEDOWN: usize = 1;
-
-/// 最多展示的记录条数，避免列表过大影响打开速度。
-const MAX_ROWS: u32 = 500;
 
 /// 列表控件样式：子窗口 + 可见 + 边框 + 报表模式 + 单选 + 始终显示选中项。
 ///
@@ -138,6 +136,9 @@ const FILTER_END_ENABLE_ID: usize = 7;
 const STATS_BUTTON_ID: usize = 8;
 /// 顶部工具栏最右侧的「导出 Excel」按钮。
 const EXPORT_BUTTON_ID: usize = 9;
+/// 底部翻页栏：「上一页 / 下一页」按钮。
+const PAGE_PREV_BUTTON_ID: usize = 10;
+const PAGE_NEXT_BUTTON_ID: usize = 11;
 
 /// 右键菜单命令 ID。
 ///
@@ -201,6 +202,10 @@ const CF_UNICODETEXT: u32 = 13;
 
 /// 顶部工具栏高度（像素）：搜索框和时间筛选在同一行。
 const TOOLBAR_HEIGHT: i32 = 36;
+/// 底部翻页栏占用的高度（列表要给这里留出空间）。
+const PAGE_BAR_HEIGHT: i32 = 34;
+/// 翻页栏里按钮的控件高度。
+const PAGE_BAR_CONTROL_HEIGHT: i32 = 24;
 
 /// 当前列表里显示的行数据。
 ///
@@ -208,11 +213,28 @@ const TOOLBAR_HEIGHT: i32 = 36;
 /// 所以刷新列表时同步缓存一份。
 static ROW_CACHE: Lazy<Mutex<Vec<FileOrigin>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
-/// 从数据库读到的全部记录（未过滤）。切换搜索关键字时从这份数据里筛，不用重新查库。
+/// 从数据库读到的**当前页**记录（已在 SQL 层按关键字 / 时间筛选并排序）。
 static ALL_ROWS: Lazy<Mutex<Vec<FileOrigin>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 /// 记录窗口使用的只读数据库连接（惰性打开，打开失败时列表为空）。
 static HISTORY_DB: Lazy<Mutex<Option<Database>>> = Lazy::new(|| Mutex::new(None));
+
+/// 每页显示多少条记录。
+///
+/// 翻页在数据库里用 `LIMIT / OFFSET` 完成，内存中始终只有一页数据，
+/// 所以再多历史记录也不会拖慢窗口。
+const PAGE_SIZE: usize = 200;
+
+/// 当前页码（0 起）。
+static PAGE: AtomicUsize = AtomicUsize::new(0);
+
+/// 当前筛选条件下的总条数（用于显示「共 N 条」和计算总页数）。
+static TOTAL_ROWS: AtomicIsize = AtomicIsize::new(0);
+
+/// 底部翻页栏的控件句柄。
+static PAGE_LABEL: AtomicIsize = AtomicIsize::new(0);
+static PAGE_PREV_BUTTON: AtomicIsize = AtomicIsize::new(0);
+static PAGE_NEXT_BUTTON: AtomicIsize = AtomicIsize::new(0);
 
 /// 显示（或重新激活）最近记录窗口。
 pub fn show() -> Result<()> {
@@ -325,7 +347,19 @@ unsafe extern "system" fn window_procedure(
                 }
                 // 搜索框内容变化：立刻按关键字重新过滤列表。
                 _ if id == SEARCH_CONTROL_ID as u32 && code == EN_CHANGE_CODE => {
-                    apply_filter(false);
+                    reload_list();
+                }
+                // 翻页：上一页 / 下一页。
+                _ if id == PAGE_PREV_BUTTON_ID as u32 => {
+                    let page = PAGE.load(Ordering::SeqCst);
+                    if page > 0 {
+                        PAGE.store(page - 1, Ordering::SeqCst);
+                        reload_current_page();
+                    }
+                }
+                _ if id == PAGE_NEXT_BUTTON_ID as u32 => {
+                    PAGE.store(PAGE.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    reload_current_page();
                 }
                 // 清除时间筛选：两个复选框取消勾选，重新读取全部记录。
                 _ if id == FILTER_CLEAR_BUTTON_ID as u32 => {
@@ -423,9 +457,9 @@ unsafe extern "system" fn window_procedure(
                     }
                     LVN_COLUMNCLICK => {
                         // 点击列头：按该列排序；再点同一列则切换升序 / 降序。
+                        // toggle_sort 内部已经会重新查询列表，这里不用再刷新。
                         let info = &*(lparam.0 as *const NMLISTVIEW);
                         toggle_sort(info.iSubItem);
-                        apply_filter(false);
                     }
                     NM_RCLICK => {
                         // 右键：先选中该行（让用户看清菜单针对哪条记录），再弹出菜单。
@@ -764,6 +798,64 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     // 给列头加上当前排序方向的箭头（默认时间倒序：↓）。
     update_sort_headers();
 
+    // 底部翻页栏：「上一页」「下一页」+ 页码说明文字。
+    // 位置在 resize_controls 里按窗口高度重新计算。
+    let prev_text = wide("上一页");
+    if let Ok(button) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(button_class.as_ptr()),
+        PCWSTR(prev_text.as_ptr()),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        12,
+        500,
+        80,
+        24,
+        window,
+        HMENU(PAGE_PREV_BUTTON_ID as *mut c_void),
+        instance,
+        None,
+    ) {
+        SendMessageW(button, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        PAGE_PREV_BUTTON.store(button.0 as isize, Ordering::SeqCst);
+    }
+
+    let next_text = wide("下一页");
+    if let Ok(button) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(button_class.as_ptr()),
+        PCWSTR(next_text.as_ptr()),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        100,
+        500,
+        80,
+        24,
+        window,
+        HMENU(PAGE_NEXT_BUTTON_ID as *mut c_void),
+        instance,
+        None,
+    ) {
+        SendMessageW(button, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        PAGE_NEXT_BUTTON.store(button.0 as isize, Ordering::SeqCst);
+    }
+
+    if let Ok(label) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(label_class.as_ptr()),
+        PCWSTR::null(),
+        WS_CHILD | WS_VISIBLE,
+        190,
+        504,
+        400,
+        20,
+        window,
+        HMENU::default(),
+        instance,
+        None,
+    ) {
+        SendMessageW(label, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        PAGE_LABEL.store(label.0 as isize, Ordering::SeqCst);
+    }
+
     resize_controls(window, list);
 }
 
@@ -779,14 +871,32 @@ unsafe fn resize_controls(window: HWND, list: HWND) {
     // 搜索框固定 160 宽，右侧依次是「程序统计」按钮和时间筛选控件；
     // 窗口变窄时只有列表宽度会被压缩，顶部控件位置保持不动。
 
-    // 列表放在工具栏下方。
+    // 列表放在工具栏下方，底部再留出一条翻页栏。
     let list_width = (client_width - 16).max(100);
-    let list_height = (client_height - TOOLBAR_HEIGHT - 8).max(100);
+    let list_height = (client_height - TOOLBAR_HEIGHT - PAGE_BAR_HEIGHT).max(100);
     let _ = MoveWindow(list, 8, TOOLBAR_HEIGHT, list_width, list_height, true);
+
+    // 翻页栏贴着窗口底部。
+    let bar_top = client_height - PAGE_BAR_CONTROL_HEIGHT - 4;
+    let prev = HWND(PAGE_PREV_BUTTON.load(Ordering::SeqCst) as *mut c_void);
+    if !prev.0.is_null() {
+        let _ = MoveWindow(prev, 12, bar_top, 80, PAGE_BAR_CONTROL_HEIGHT, true);
+    }
+    let next = HWND(PAGE_NEXT_BUTTON.load(Ordering::SeqCst) as *mut c_void);
+    if !next.0.is_null() {
+        let _ = MoveWindow(next, 100, bar_top, 80, PAGE_BAR_CONTROL_HEIGHT, true);
+    }
+    let label = HWND(PAGE_LABEL.load(Ordering::SeqCst) as *mut c_void);
+    if !label.0.is_null() {
+        let _ = MoveWindow(label, 192, bar_top + 3, 400, 20, true);
+    }
 }
 
-/// 从数据库读取最近记录（失败时返回空列表）。
-fn load_rows() -> Vec<FileOrigin> {
+/// 从数据库读取当前页的记录，同时返回符合条件的总条数。
+///
+/// 筛选（关键字 / 时间范围）、排序、分页全部在 SQL 里完成，
+/// 所以无论历史数据有多少，内存里始终只有一页记录。
+fn load_page() -> (Vec<FileOrigin>, i64) {
     let mut guard = match HISTORY_DB.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -800,11 +910,25 @@ fn load_rows() -> Vec<FileOrigin> {
         }
     }
 
-    let range = time_filter_range();
+    // 当前页条件：搜索框文字 + 时间筛选 + 当前排序 + 页码偏移。
+    let request = crate::db::PageRequest {
+        keyword: search_text(),
+        range: time_filter_range(),
+        sort_column: SORT_COLUMN.load(Ordering::SeqCst) as i32,
+        ascending: SORT_ASCENDING.load(Ordering::SeqCst),
+        limit: PAGE_SIZE,
+        offset: PAGE.load(Ordering::SeqCst) * PAGE_SIZE,
+    };
+
     match guard.as_ref() {
-        // 有时间筛选时只查这个时间段内的记录，没有则查全部最近记录。
-        Some(db) => db.recent_filtered(MAX_ROWS, range).unwrap_or_default(),
-        None => Vec::new(),
+        Some(db) => match db.query_page(&request) {
+            Ok(result) => result,
+            Err(error) => {
+                log::error!("读取记录分页失败：{:#}", error);
+                (Vec::new(), 0)
+            }
+        },
+        None => (Vec::new(), 0),
     }
 }
 
@@ -974,7 +1098,11 @@ pub(crate) fn open_path_target(row: &FileOrigin) {
 /// 就会看到列表“闪一下”并被弹回顶部，完全没法浏览。
 /// 绝大多数刷新周期里并没有新记录，直接返回即可。
 fn refresh_list() {
-    let rows = load_rows();
+    let (rows, total) = load_page();
+
+    // 总条数可能因为新记录而变化，翻页栏要跟着更新。
+    TOTAL_ROWS.store(total as isize, Ordering::SeqCst);
+    update_page_bar();
 
     // 和上次读到的数据完全相同就什么都不做，连重绘都不触发。
     let unchanged = ALL_ROWS.lock().map(|cache| *cache == rows).unwrap_or(false);
@@ -983,55 +1111,80 @@ fn refresh_list() {
     }
 
     if let Ok(mut cache) = ALL_ROWS.lock() {
-        *cache = rows;
+        *cache = rows.clone();
     }
     // 有新记录：重建列表，但保持用户当前的滚动位置。
-    apply_filter(true);
+    fill_list(&rows, true);
 }
 
 /// 用户主动改变筛选条件（搜索 / 排序 / 时间范围）后刷新列表。
 ///
-/// 这时列表内容本来就会整体变化，恢复旧滚动位置没有意义，
-/// 回到顶部更符合预期，所以不保持滚动位置。
+/// 条件变了，页码必须回到第 1 页，否则可能停在一个空页上。
 fn reload_list() {
-    let rows = load_rows();
-    if let Ok(mut cache) = ALL_ROWS.lock() {
-        *cache = rows;
-    }
-    apply_filter(false);
+    PAGE.store(0, Ordering::SeqCst);
+    reload_current_page();
 }
 
-/// 按搜索框里的关键字过滤记录，并重新填充列表。
-///
-/// `keep_scroll` 为 true 时尽量保持用户当前的滚动位置和选中行（定时刷新用）；
-/// 用户主动改了筛选条件时传 false，列表直接回到顶部。
-fn apply_filter(keep_scroll: bool) {
-    let keyword = search_text().to_lowercase();
-    let rows = ALL_ROWS
-        .lock()
-        .map(|cache| cache.clone())
-        .unwrap_or_default();
+/// 按当前页码重新查询并填充列表（翻页按钮、筛选条件变化都走这里）。
+fn reload_current_page() {
+    let (mut rows, total) = load_page();
 
-    let filtered: Vec<FileOrigin> = if keyword.is_empty() {
-        rows
+    // 数据被删到不足当前页时，自动退到最后一页，避免停在空白页。
+    if rows.is_empty() && total > 0 && PAGE.load(Ordering::SeqCst) > 0 {
+        let last_page = (total as usize - 1) / PAGE_SIZE;
+        PAGE.store(last_page, Ordering::SeqCst);
+        let (last_rows, last_total) = load_page();
+        rows = last_rows;
+        TOTAL_ROWS.store(last_total as isize, Ordering::SeqCst);
     } else {
-        rows.into_iter()
-            .filter(|row| matches_keyword(row, &keyword))
-            .collect()
+        TOTAL_ROWS.store(total as isize, Ordering::SeqCst);
+    }
+
+    if let Ok(mut cache) = ALL_ROWS.lock() {
+        *cache = rows.clone();
+    }
+    fill_list(&rows, false);
+    update_page_bar();
+}
+
+/// 刷新底部翻页栏的文字和按钮状态。
+fn update_page_bar() {
+    let total = TOTAL_ROWS.load(Ordering::SeqCst);
+    let page = PAGE.load(Ordering::SeqCst);
+    let page_size = PAGE_SIZE as isize;
+    // 没有数据时也显示「1 / 1」，避免出现「1 / 0」这种怪数字。
+    let total_pages = if total <= 0 {
+        1
+    } else {
+        ((total + page_size - 1) / page_size) as usize
     };
 
-    let mut filtered = filtered;
-    sort_rows(&mut filtered);
-    fill_list(&filtered, keep_scroll);
-}
+    let label = HWND(PAGE_LABEL.load(Ordering::SeqCst) as *mut c_void);
+    if !label.0.is_null() {
+        let text = if total <= 0 {
+            "共 0 条".to_string()
+        } else {
+            format!("第 {} / {} 页 · 共 {} 条", page + 1, total_pages, total)
+        };
+        let text = wide(&text);
+        unsafe {
+            let _ = SetWindowTextW(label, PCWSTR(text.as_ptr()));
+        }
+    }
 
-/// 判断一条记录是否匹配搜索关键字（程序名 / 路径 / 类型 / 备注，忽略大小写）。
-fn matches_keyword(row: &FileOrigin, keyword: &str) -> bool {
-    row.process_name.to_lowercase().contains(keyword)
-        || row.file_path.to_lowercase().contains(keyword)
-        || row.process_path.to_lowercase().contains(keyword)
-        || row.note.to_lowercase().contains(keyword)
-        || action_label(&row.action).to_lowercase().contains(keyword)
+    let prev = HWND(PAGE_PREV_BUTTON.load(Ordering::SeqCst) as *mut c_void);
+    if !prev.0.is_null() {
+        unsafe {
+            let _ = EnableWindow(prev, page > 0);
+        }
+    }
+
+    let next = HWND(PAGE_NEXT_BUTTON.load(Ordering::SeqCst) as *mut c_void);
+    if !next.0.is_null() {
+        unsafe {
+            let _ = EnableWindow(next, page + 1 < total_pages);
+        }
+    }
 }
 
 /// 读取搜索框里当前的文字。
@@ -1149,32 +1302,8 @@ fn toggle_sort(column: i32) {
         SORT_ASCENDING.store(column != 0, Ordering::SeqCst);
     }
     update_sort_headers();
-}
-
-/// 按当前排序状态给记录排序（时间 / 程序 / 路径 / 类型）。
-fn sort_rows(rows: &mut [FileOrigin]) {
-    let column = SORT_COLUMN.load(Ordering::SeqCst);
-    let ascending = SORT_ASCENDING.load(Ordering::SeqCst);
-
-    rows.sort_by(|a, b| {
-        // 0=日期、1=时间，两列都按同一条记录的时间戳排序。
-        let ordering = if column == PROGRAM_COLUMN as isize {
-            program_column_text(a)
-                .to_lowercase()
-                .cmp(&program_column_text(b).to_lowercase())
-        } else if column == PATH_COLUMN as isize {
-            a.file_path.to_lowercase().cmp(&b.file_path.to_lowercase())
-        } else if column == TYPE_COLUMN as isize {
-            action_label(&a.action).cmp(&action_label(&b.action))
-        } else {
-            a.created_at.cmp(&b.created_at)
-        };
-        if ascending {
-            ordering
-        } else {
-            ordering.reverse()
-        }
-    });
+    // 排序在数据库查询里完成，改排序后要回到第 1 页重新查。
+    reload_list();
 }
 
 /// 在列头文字后面加上 ↑ / ↓，让用户一眼看出当前按哪列、哪个方向排序。
@@ -1559,7 +1688,10 @@ fn program_column_text(row: &FileOrigin) -> String {
 /// - `create_dir`  ：新建文件夹
 /// - `modify`      ：修改文件
 /// - 其它（`create_file`）：新建文件
-fn action_label(action: &str) -> String {
+/// 把数据库里的动作代码翻译成中文类型名。
+///
+/// `pub(crate)` 是为了让数据库层在按关键字搜索时也能复用同一套中文名。
+pub(crate) fn action_label(action: &str) -> String {
     match action {
         "create_dir" => "新建文件夹".to_string(),
         "modify" => "修改文件".to_string(),
@@ -1828,8 +1960,7 @@ pub fn run_message_loop() {
 #[cfg(test)]
 mod tests {
     use super::column_at_x;
-    use super::{program_column_text, sort_rows, FileOrigin, SORT_ASCENDING, SORT_COLUMN};
-    use std::sync::atomic::Ordering;
+    use super::{program_column_text, FileOrigin};
 
     fn test_row(path: &str, program: &str, created_at: i64) -> FileOrigin {
         FileOrigin {
@@ -1840,49 +1971,6 @@ mod tests {
             action: "create_file".to_string(),
             note: String::new(),
         }
-    }
-
-    /// 验证排序：按路径升序 / 降序，以及按时间升降序。
-    ///
-    /// 排序状态存在全局静态变量里，测试里显式设置并在结束时还原，
-    /// 避免影响其它依赖默认排序的测试。
-    #[test]
-    fn sort_rows_orders_by_selected_column() {
-        let mut rows = vec![
-            test_row(r"C:\b\b.txt", "m.exe", 2),
-            test_row(r"C:\a\a.txt", "Zeta.exe", 3),
-            test_row(r"C:\c\c.txt", "alpha.exe", 1),
-        ];
-
-        // 路径升序：a < b < c（路径现为第 3 列）
-        SORT_COLUMN.store(3, Ordering::SeqCst);
-        SORT_ASCENDING.store(true, Ordering::SeqCst);
-        sort_rows(&mut rows);
-        assert_eq!(rows[0].file_path, r"C:\a\a.txt");
-        assert_eq!(rows[2].file_path, r"C:\c\c.txt");
-
-        // 路径降序
-        SORT_ASCENDING.store(false, Ordering::SeqCst);
-        sort_rows(&mut rows);
-        assert_eq!(rows[0].file_path, r"C:\c\c.txt");
-
-        // 程序名升序（忽略大小写：alpha < m < Zeta；程序现为第 2 列）
-        SORT_COLUMN.store(2, Ordering::SeqCst);
-        SORT_ASCENDING.store(true, Ordering::SeqCst);
-        sort_rows(&mut rows);
-        assert_eq!(program_column_text(&rows[0]), "alpha.exe");
-        assert_eq!(program_column_text(&rows[2]), "Zeta.exe");
-
-        // 时间升序
-        SORT_COLUMN.store(0, Ordering::SeqCst);
-        SORT_ASCENDING.store(true, Ordering::SeqCst);
-        sort_rows(&mut rows);
-        assert_eq!(rows[0].created_at, 1);
-
-        // 还原默认：时间倒序
-        SORT_ASCENDING.store(false, Ordering::SeqCst);
-        sort_rows(&mut rows);
-        assert_eq!(rows[0].created_at, 3);
     }
 
     /// 验证“光标 x 坐标 -> 列下标”的换算与列宽严格一致。

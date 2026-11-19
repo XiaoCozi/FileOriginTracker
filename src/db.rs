@@ -168,6 +168,111 @@ pub struct RecordFilter {
     pub range: Option<(i64, i64)>,
 }
 
+/// 分页查询请求（供「最近记录」窗口翻页使用）。
+#[derive(Debug, Clone, Default)]
+pub struct PageRequest {
+    /// 搜索关键字：匹配路径 / 程序名 / 程序路径 / 备注 / 类型名。
+    pub keyword: String,
+    /// 时间范围（Unix 秒，闭区间）。
+    pub range: Option<(i64, i64)>,
+    /// 排序列：0=时间 2=程序 3=路径 4=类型（1 与 0 同义）。
+    pub sort_column: i32,
+    /// 是否升序。
+    pub ascending: bool,
+    /// 每页条数。
+    pub limit: usize,
+    /// 跳过多少条（页码 × 每页条数）。
+    pub offset: usize,
+}
+
+/// 三类数据合并成的统一视图，并左连接程序备注。
+///
+/// `query_records`（导出）和 `query_page`（列表分页）共用同一段 SQL，
+/// 避免两处写法不一致导致「看到的数据和导出的数据不一样」。
+const RECORDS_FROM: &str = r#"
+ FROM (
+     SELECT file_path, process_name, process_path, created_at,
+            CASE WHEN is_directory <> 0 THEN 'create_dir' ELSE 'create_file' END AS action
+     FROM file_origins
+     UNION ALL
+     SELECT file_path, process_name, process_path, modified_at AS created_at,
+            'modify' AS action
+     FROM file_modifications
+     UNION ALL
+     SELECT file_path, process_name, process_path, deleted_at AS created_at,
+            CASE WHEN is_directory <> 0 THEN 'delete_dir' ELSE 'delete_file' END AS action
+     FROM file_deletions
+ ) AS t
+ LEFT JOIN program_notes n ON n.process_path = t.process_path
+"#;
+
+/// 构造分页查询共用的 WHERE 子句与对应参数。
+///
+/// 统计总数和查询本页数据都要用同一套条件，所以抽成函数，
+/// 保证两次查询的过滤结果严格一致。
+fn build_page_where(
+    keyword: &str,
+    range: Option<(i64, i64)>,
+) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut where_sql = String::from(
+        " WHERE t.file_path <> '' AND t.process_name <> '' AND t.process_path <> ''",
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    let keyword = keyword.trim();
+    if !keyword.is_empty() {
+        let pattern = format!("%{}%", keyword);
+        where_sql.push_str(
+            " AND (t.file_path LIKE ? OR t.process_name LIKE ? OR t.process_path LIKE ? \
+             OR COALESCE(n.note, '') LIKE ?",
+        );
+        // 四个 LIKE 各自对应一个同名参数。
+        for _ in 0..4 {
+            args.push(Box::new(pattern.clone()));
+        }
+
+        // 关键字也可能是在搜「类型」，例如输入“删除”。
+        let actions = actions_matching_keyword(keyword);
+        if !actions.is_empty() {
+            let placeholders = vec!["?"; actions.len()].join(",");
+            where_sql.push_str(&format!(" OR t.action IN ({})", placeholders));
+            for action in actions {
+                args.push(Box::new(action.to_string()));
+            }
+        }
+        where_sql.push(')');
+    }
+
+    if let Some((start, end)) = range {
+        where_sql.push_str(" AND t.created_at >= ? AND t.created_at <= ?");
+        args.push(Box::new(start));
+        args.push(Box::new(end));
+    }
+
+    (where_sql, args)
+}
+
+/// 关键字命中了哪些监视类型（匹配中文类型名，例如“删除”命中两种删除类型）。
+fn actions_matching_keyword(keyword: &str) -> Vec<&'static str> {
+    const ACTIONS: [&str; 5] = [
+        "create_file",
+        "create_dir",
+        "modify",
+        "delete_file",
+        "delete_dir",
+    ];
+    let keyword = keyword.to_lowercase();
+    ACTIONS
+        .iter()
+        .copied()
+        .filter(|action| {
+            crate::history::action_label(action)
+                .to_lowercase()
+                .contains(&keyword)
+        })
+        .collect()
+}
+
 impl Database {
     /// 初始化数据库（创建连接 + 建表）
     pub fn init(data_dir: &Path) -> Result<Self> {
@@ -529,26 +634,13 @@ impl Database {
 
         // 先用一个和 recent_filtered 完全一致的 UNION 视图把三类数据合并，
         // 再按需往 WHERE 后面追加条件。
-        let mut sql = String::from(
-            r#"
-            SELECT t.file_path, t.process_name, t.process_path, t.created_at, t.action,
-                   COALESCE(n.note, '')
-            FROM (
-                SELECT file_path, process_name, process_path, created_at,
-                       CASE WHEN is_directory <> 0 THEN 'create_dir' ELSE 'create_file' END AS action
-                FROM file_origins
-                UNION ALL
-                SELECT file_path, process_name, process_path, modified_at AS created_at,
-                       'modify' AS action
-                FROM file_modifications
-                UNION ALL
-                SELECT file_path, process_name, process_path, deleted_at AS created_at,
-                       CASE WHEN is_directory <> 0 THEN 'delete_dir' ELSE 'delete_file' END AS action
-                FROM file_deletions
-            ) AS t
-            LEFT JOIN program_notes n ON n.process_path = t.process_path
-            WHERE t.file_path <> '' AND t.process_name <> '' AND t.process_path <> ''
-            "#,
+        let mut sql = format!(
+            "SELECT t.file_path, t.process_name, t.process_path, t.created_at, t.action, \
+                    COALESCE(n.note, ''){}",
+            RECORDS_FROM
+        );
+        sql.push_str(
+            " WHERE t.file_path <> '' AND t.process_name <> '' AND t.process_path <> ''",
         );
 
         // 动态参数按追加顺序收集，和 SQL 里的 ? 一一对应。
@@ -613,6 +705,71 @@ impl Database {
             result.push(row?);
         }
         Ok(result)
+    }
+
+    /// 按页查询记录，同时返回符合条件的总条数。
+    ///
+    /// 返回 `(本页记录, 总条数)`。排序和分页都在 SQL 里完成，
+    /// 所以无论翻到第几页、数据量多大，内存里始终只有一页的数据。
+    pub fn query_page(&self, request: &PageRequest) -> Result<(Vec<FileOrigin>, i64)> {
+        let conn = self.lock_connection();
+
+        // 第一步：统计符合条件的总条数，供界面显示「共 N 条」。
+        let (where_sql, count_args) = build_page_where(&request.keyword, request.range);
+        let count_sql = format!("SELECT COUNT(*){}{}", RECORDS_FROM, where_sql);
+        let total: i64 = conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(count_args.iter().map(|value| value.as_ref())),
+            |row| row.get(0),
+        )?;
+
+        // 第二步：按当前排序列查询本页数据。
+        // 末尾追加 `t.created_at DESC, t.file_path` 作为稳定排序：
+        // 同值记录顺序固定，翻页时不会出现重复或漏行。
+        let order = match request.sort_column {
+            2 => "t.process_name COLLATE NOCASE",
+            3 => "t.file_path COLLATE NOCASE",
+            4 => "t.action",
+            _ => "t.created_at",
+        };
+        let direction = if request.ascending { "ASC" } else { "DESC" };
+
+        let mut data_sql = format!(
+            "SELECT t.file_path, t.process_name, t.process_path, t.created_at, t.action, \
+                    COALESCE(n.note, ''){}",
+            RECORDS_FROM
+        );
+        data_sql.push_str(&where_sql);
+        data_sql.push_str(&format!(
+            " ORDER BY {} {}, t.created_at DESC, t.file_path ASC, t.action ASC LIMIT ? OFFSET ?",
+            order, direction
+        ));
+
+        // 参数需要重新构造一遍（上一组已在统计总数时用掉）。
+        let (_, mut data_args) = build_page_where(&request.keyword, request.range);
+        data_args.push(Box::new(request.limit as i64));
+        data_args.push(Box::new(request.offset as i64));
+
+        let mut stmt = conn.prepare(&data_sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(data_args.iter().map(|value| value.as_ref())),
+            |row| {
+                Ok(FileOrigin {
+                    file_path: row.get(0)?,
+                    process_name: row.get(1)?,
+                    process_path: row.get(2)?,
+                    created_at: row.get(3)?,
+                    action: row.get(4)?,
+                    note: row.get(5)?,
+                })
+            },
+        )?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok((result, total))
     }
 
     /// 返回数据库里出现过的所有程序（名称, 完整路径），按名称排序。
@@ -1495,6 +1652,59 @@ mod tests {
         // 下拉框数据源：三个不同的程序
         let choices = db.program_choices().unwrap();
         assert_eq!(choices.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 验证分页查询：总数正确、排序正确、翻页不重复不遗漏。
+    #[test]
+    fn query_page_paginates_and_sorts() {
+        let dir = std::env::temp_dir().join("file_origin_tracker_db_test_page");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Database::init(&dir).unwrap();
+
+        // 造 5 条记录，程序名交替，方便同时验证关键字过滤。
+        for index in 0..5 {
+            let program = if index % 2 == 0 { "a.exe" } else { "b.exe" };
+            let path = format!(r"C:\page\f{}.txt", index);
+            let program_path = format!(r"C:\{}", program);
+            db.upsert_origin(&path, program, &program_path, false)
+                .unwrap();
+        }
+
+        // 按路径升序，每页 2 条。
+        let mut request = PageRequest {
+            sort_column: 3,
+            ascending: true,
+            limit: 2,
+            offset: 0,
+            ..Default::default()
+        };
+
+        let (first, total) = db.query_page(&request).unwrap();
+        assert_eq!(total, 5, "总数应是全部 5 条");
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].file_path, r"C:\page\f0.txt");
+        assert_eq!(first[1].file_path, r"C:\page\f1.txt");
+
+        // 第二页
+        request.offset = 2;
+        let (second, _) = db.query_page(&request).unwrap();
+        assert_eq!(second[0].file_path, r"C:\page\f2.txt");
+        assert_eq!(second[1].file_path, r"C:\page\f3.txt");
+
+        // 最后一页只剩 1 条
+        request.offset = 4;
+        let (last, _) = db.query_page(&request).unwrap();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].file_path, r"C:\page\f4.txt");
+
+        // 关键字过滤后总数也要跟着变
+        request.keyword = "b.exe".to_string();
+        request.offset = 0;
+        let (filtered, filtered_total) = db.query_page(&request).unwrap();
+        assert_eq!(filtered_total, 2);
+        assert_eq!(filtered.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
