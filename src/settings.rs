@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    GetLastError, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+    GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -26,10 +26,11 @@ use windows::Win32::System::Registry::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetWindowTextW, LoadCursorW, MessageBoxW, RegisterClassExW,
     SendMessageW, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
-    BS_AUTORADIOBUTTON, BS_GROUPBOX, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_NUMBER,
+    BS_AUTORADIOBUTTON, BS_OWNERDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_NUMBER,
     HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW, MB_ICONWARNING, MB_OK, SW_HIDE, SW_SHOWNORMAL,
     WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_SETICON, WNDCLASSEXW, WS_CHILD,
+    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_PAINT, WM_SETICON,
+    WNDCLASSEXW, WS_CHILD,
     WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -78,6 +79,16 @@ const RUN_VALUE_NAME: &str = "FileOriginTracker";
 
 static SETTINGS_WINDOW: AtomicIsize = AtomicIsize::new(0);
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// 各分组框的位置与标题。`WM_PAINT` 里按这份表统一绘制，
+/// 和创建控件的坐标保持一致（改坐标时两处要一起改）。
+const SECTIONS: [(&str, i32, i32, i32, i32); 5] = [
+    ("记录保存", 16, 12, 512, 84),
+    ("启动", 16, 104, 512, 62),
+    ("文件监控（可分别开关，全部关闭时停止监控）", 16, 174, 512, 206),
+    ("黑白名单模式", 16, 388, 512, 80),
+    ("资源管理器右键菜单", 16, 476, 512, 88),
+];
 
 /// 打开（或重新激活）设置窗口。
 pub fn show() -> Result<()> {
@@ -158,6 +169,33 @@ unsafe extern "system" fn window_procedure(
             create_controls(hwnd);
             LRESULT(0)
         }
+        WM_PAINT => {
+            // 自己画分组框：系统的 BS_GROUPBOX 带 3D 凹凸边，
+            // 和几何风格不搭，这里用细线 + 左上角标题代替。
+            let mut paint = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+            let device = windows::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut paint);
+            let mut client = windows::Win32::Foundation::RECT::default();
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
+            crate::theme::fill(device, &client, crate::theme::BG);
+            for (title, x, y, width, height) in SECTIONS {
+                let rect = windows::Win32::Foundation::RECT {
+                    left: x,
+                    top: y,
+                    right: x + width,
+                    bottom: y + height,
+                };
+                crate::theme::draw_section(device, &rect, title);
+            }
+            let _ = windows::Win32::Graphics::Gdi::EndPaint(hwnd, &paint);
+            LRESULT(0)
+        }
+        WM_DRAWITEM => {
+            // 所有普通按钮统一画成平面几何风格；「保存」是主按钮。
+            let info = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+            let id = (info.CtlID & 0xFFFF) as usize;
+            crate::theme::draw_button_auto(info, id == ID_SAVE_BUTTON);
+            LRESULT(1)
+        }
         WM_COMMAND => {
             match wparam.0 & 0xFFFF {
                 ID_SAVE_BUTTON => {
@@ -192,11 +230,11 @@ unsafe extern "system" fn window_procedure(
             }
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
-            // 白色背景 + 深灰文字：分组框、标签、输入框和窗口融为一体，
+            // 白色背景 + 深灰文字：标签、输入框和窗口融为一体，
             // 不会出现系统默认的灰色块。
             let device = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut std::ffi::c_void);
-            SetBkColor(device, COLORREF(0x00FF_FFFF));
-            SetTextColor(device, COLORREF(0x0020_2020));
+            SetBkColor(device, crate::theme::BG);
+            SetTextColor(device, crate::theme::TEXT);
             LRESULT(crate::util::ui_brush().0 as isize)
         }
         WM_ACTIVATE => {
@@ -240,13 +278,12 @@ unsafe fn create_controls(window: HWND) {
     let check_style =
         WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32);
     let button_style =
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32);
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32);
     let edit_style = WINDOW_STYLE(
         WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | ES_NUMBER as u32 | ES_AUTOHSCROLL as u32,
     );
 
     // ---- 分组 1：记录保存 ----
-    create_group(window, "记录保存", 16, 12, 512, 84, font);
     set_font(
         create_control(
             WINDOW_EX_STYLE::default(),
@@ -309,7 +346,6 @@ unsafe fn create_controls(window: HWND) {
     );
 
     // ---- 分组 2：启动 ----
-    create_group(window, "启动", 16, 104, 512, 62, font);
     set_font(
         create_control(
             WINDOW_EX_STYLE::default(),
@@ -327,15 +363,6 @@ unsafe fn create_controls(window: HWND) {
     );
 
     // ---- 分组 3：文件监控 ----
-    create_group(
-        window,
-        "文件监控（可分别开关，全部关闭时停止监控）",
-        16,
-        174,
-        512,
-        206,
-        font,
-    );
     set_font(
         create_control(
             WINDOW_EX_STYLE::default(),
@@ -428,7 +455,6 @@ unsafe fn create_controls(window: HWND) {
     );
 
     // ---- 分组 4：名单模式 ----
-    create_group(window, "黑白名单模式", 16, 388, 512, 80, font);
     set_font(
         create_control(
             WINDOW_EX_STYLE::default(),
@@ -493,7 +519,6 @@ unsafe fn create_controls(window: HWND) {
     );
 
     // ---- 分组 5：资源管理器右键菜单 ----
-    create_group(window, "资源管理器右键菜单", 16, 476, 512, 88, font);
     set_font(
         create_control(
             WINDOW_EX_STYLE::default(),
@@ -586,31 +611,9 @@ unsafe fn create_controls(window: HWND) {
         ),
         font,
     );
-}
 
-/// 创建一个分组框（带标题的方框），用来把相关设置归到一组。
-unsafe fn create_group(
-    window: HWND,
-    title: &str,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    font: windows::Win32::Graphics::Gdi::HFONT,
-) {
-    let control = create_control(
-        WINDOW_EX_STYLE::default(),
-        "BUTTON",
-        title,
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | BS_GROUPBOX as u32),
-        x,
-        y,
-        width,
-        height,
-        window,
-        0,
-    );
-    set_font(control, font);
+    // 复选框 / 单选框统一换成几何风格的自绘外观（点击与取值逻辑不变）。
+    crate::theme::style_children(window);
 }
 
 /// 创建一个子控件并返回句柄。
@@ -1098,3 +1101,4 @@ fn delete_registry_value(key_path: &str, value_name: &str) -> Result<()> {
     }
     Ok(())
 }
+

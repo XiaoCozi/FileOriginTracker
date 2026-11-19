@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -38,9 +38,10 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, LoadCursorW, MessageBoxW, MoveWindow,
     RegisterClassExW, SendMessageW, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK,
-    BS_AUTORADIOBUTTON, BS_PUSHBUTTON, BS_PUSHLIKE, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW,
+    BS_AUTORADIOBUTTON, BS_OWNERDRAW, BS_PUSHLIKE, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW,
     MB_ICONWARNING, MB_OK, SW_HIDE, SW_SHOWNORMAL, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_NOTIFY,
+    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM,
+    WM_NOTIFY,
     WM_SETICON, WM_SIZE, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW,
     WS_TABSTOP, WS_VISIBLE,
 };
@@ -225,9 +226,15 @@ unsafe extern "system" fn window_procedure(
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
             let device = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
-            SetBkColor(device, COLORREF(0x00FF_FFFF));
-            SetTextColor(device, COLORREF(0x0020_2020));
+            SetBkColor(device, crate::theme::BG);
+            SetTextColor(device, crate::theme::TEXT);
             LRESULT(crate::util::ui_brush().0 as isize)
+        }
+        WM_DRAWITEM => {
+            // 底部操作按钮统一为平面几何风格。
+            let info = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+            crate::theme::draw_button_auto(info, false);
+            LRESULT(1)
         }
         WM_ACTIVATE => {
             if (wparam.0 & 0xFFFF) as u32 != WA_INACTIVE {
@@ -333,7 +340,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32 | BS_PUSHLIKE as u32,
     );
     let button_style =
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32);
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32);
 
     let mut controls_to_style: Vec<HWND> = Vec::new();
 

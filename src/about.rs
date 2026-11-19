@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -20,8 +20,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetDlgItem, IsWindow, LoadCursorW, RegisterClassExW, SendMessageW, ShowWindow,
     TranslateMessage, CW_USEDEFAULT, HMENU, IDC_ARROW, ICON_BIG, ICON_SMALL, MSG, SW_SHOWNORMAL,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC, WM_SETFONT,
-    WM_SETICON, WNDCLASSEXW, BS_PUSHBUTTON, WS_CAPTION, WS_CHILD, WS_SYSMENU, WS_TABSTOP,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC, WM_DRAWITEM,
+    WM_SETFONT, WM_SETICON, WNDCLASSEXW, BS_OWNERDRAW, WS_CAPTION, WS_CHILD, WS_SYSMENU, WS_TABSTOP,
     WS_VISIBLE,
 };
 
@@ -173,13 +173,19 @@ unsafe extern "system" fn window_procedure(
             let link = GetDlgItem(hwnd, ID_GITHUB_LINK as i32).unwrap_or_default();
 
             if control == link {
-                // 蓝色（COLORREF 是 BGR 顺序，所以 0x00RRGGBB 里蓝色在最后）。
-                SetTextColor(device, COLORREF(0x0000_00FF));
+                // 超链接用全局强调色，和其它界面的蓝色保持一致。
+                SetTextColor(device, crate::theme::ACCENT);
             } else {
-                SetTextColor(device, COLORREF(0x0020_2020));
+                SetTextColor(device, crate::theme::TEXT);
             }
-            SetBkColor(device, COLORREF(0x00FF_FFFF));
+            SetBkColor(device, crate::theme::BG);
             LRESULT(crate::util::ui_brush().0 as isize)
+        }
+        WM_DRAWITEM => {
+            // 「确定」是主按钮，用强调色实心底。
+            let info = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+            crate::theme::draw_button_auto(info, info.CtlID as usize == ID_OK_BUTTON);
+            LRESULT(1)
         }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
@@ -214,7 +220,7 @@ unsafe fn create_controls(window: HWND) {
     // 这样点击链接时窗口过程能收到消息并打开浏览器。
     let link_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | SS_NOTIFY | SS_LEFT);
     // 按钮样式。
-    let button_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32);
+    let button_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32);
 
     // —— 项目名称（标题）——
     create_static(window, PROJECT_NAME, 20, 16, 440, 24, font, label_style, 0);

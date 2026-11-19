@@ -51,7 +51,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetMessageW, GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MessageBoxW,
     MoveWindow, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
     SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK,
-    BS_AUTOCHECKBOX, BS_OWNERDRAW, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG,
+    BS_AUTOCHECKBOX, BS_OWNERDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG,
     ICON_SMALL,
     IDC_ARROW, MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL,
     TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -502,6 +502,20 @@ unsafe extern "system" fn window_procedure(
                 );
                 return LRESULT(1);
             }
+
+            // 工具栏和翻页栏的普通按钮：统一几何风格平面按钮。
+            let id = info.CtlID as usize;
+            if matches!(
+                id,
+                STATS_BUTTON_ID
+                    | FILTER_CLEAR_BUTTON_ID
+                    | EXPORT_BUTTON_ID
+                    | PAGE_PREV_BUTTON_ID
+                    | PAGE_NEXT_BUTTON_ID
+            ) {
+                crate::theme::draw_button_auto(info, false);
+                return LRESULT(1);
+            }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
@@ -608,7 +622,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         WINDOW_EX_STYLE::default(),
         PCWSTR(stats_class.as_ptr()),
         PCWSTR(stats_text.as_ptr()),
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32),
         222,
         8,
         84,
@@ -738,7 +752,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         WINDOW_EX_STYLE::default(),
         PCWSTR(button_class.as_ptr()),
         PCWSTR(clear_text.as_ptr()),
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32),
         878,
         8,
         84,
@@ -758,7 +772,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         WINDOW_EX_STYLE::default(),
         PCWSTR(button_class.as_ptr()),
         PCWSTR(export_text.as_ptr()),
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32),
         970,
         8,
         90,
@@ -832,7 +846,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         WINDOW_EX_STYLE::default(),
         PCWSTR(button_class.as_ptr()),
         PCWSTR(prev_text.as_ptr()),
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32),
         12,
         500,
         80,
@@ -851,7 +865,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         WINDOW_EX_STYLE::default(),
         PCWSTR(button_class.as_ptr()),
         PCWSTR(next_text.as_ptr()),
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32),
         100,
         500,
         80,
@@ -884,6 +898,9 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     }
 
     resize_controls(window, list);
+
+    // 复选框统一换成几何风格的自绘外观（点击逻辑不变）。
+    crate::theme::style_children(window);
 }
 
 /// 让搜索框和列表跟随窗口大小变化。
@@ -2114,3 +2131,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+

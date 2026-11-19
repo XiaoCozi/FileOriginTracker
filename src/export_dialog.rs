@@ -10,24 +10,22 @@
 
 use once_cell::sync::Lazy;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, SYSTEMTIME, WPARAM};
 use windows::Win32::Graphics::Gdi::{HFONT, SetBkColor, SetTextColor};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{
-    DTM_GETSYSTEMTIME, DTM_SETFORMATW, ICC_DATE_CLASSES, ICC_LISTVIEW_CLASSES,
-    INITCOMMONCONTROLSEX, InitCommonControlsEx,
-};
+use windows::Win32::UI::Controls::{ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL,
+    BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_OWNERDRAW, CB_ADDSTRING, CB_GETCURSEL,
     CBS_AUTOHSCROLL, CBS_DROPDOWN, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow,
     DispatchMessageW, GetDlgItem, GetMessageW, GetWindowTextW, IsWindow, LoadCursorW,
     MSG, MessageBoxW, RegisterClassExW, SW_SHOWNORMAL, SendMessageW, ShowWindow, TranslateMessage,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_SETFONT, WNDCLASSEXW,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_SETFONT,
+    WNDCLASSEXW,
     WINDOW_EX_STYLE, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_GROUP, WS_SYSMENU, WS_TABSTOP,
     WS_VISIBLE, WS_VSCROLL, BM_GETCHECK,
 };
@@ -75,6 +73,10 @@ pub enum ExportScope {
 /// 用户确认后的结果。`None` 表示点了取消。
 static RESULT: Lazy<Mutex<Option<ExportScope>>> = Lazy::new(|| Mutex::new(None));
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// 「起 / 止」两个时间框当前选择的 Unix 秒数。
+static TIME_START_VALUE: AtomicI64 = AtomicI64::new(0);
+static TIME_END_VALUE: AtomicI64 = AtomicI64::new(0);
 
 /// 属于「筛选」范围、需要随单选按钮一起启用 / 禁用的控件句柄。
 static FILTER_CONTROLS: Lazy<Mutex<Vec<isize>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -179,6 +181,8 @@ unsafe extern "system" fn window_procedure(
             match id {
                 // 两个单选按钮切换：决定下方筛选控件是否可用。
                 ID_SCOPE_ALL | ID_SCOPE_FILTER => apply_scope_state(hwnd),
+                // 点击「起 / 止」时间框：打开几何风格日期时间浮窗。
+                ID_TIME_START | ID_TIME_END => open_time_popup(hwnd, id),
                 ID_EXPORT_BUTTON => try_confirm(hwnd),
                 ID_CANCEL_BUTTON => {
                     let _ = DestroyWindow(hwnd);
@@ -194,9 +198,32 @@ unsafe extern "system" fn window_procedure(
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
             // 标签与输入框背景保持白色，和窗口一致。
             let device = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
-            SetBkColor(device, windows::Win32::Foundation::COLORREF(0x00FF_FFFF));
-            SetTextColor(device, windows::Win32::Foundation::COLORREF(0x0020_2020));
+            SetBkColor(device, crate::theme::BG);
+            SetTextColor(device, crate::theme::TEXT);
             LRESULT(crate::util::ui_brush().0 as isize)
+        }
+        WM_DRAWITEM => {
+            let info = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+            match info.CtlID as usize {
+                // 两个时间框：平面白底 + 日历图标，和其它界面一致。
+                ID_TIME_START => {
+                    let enabled = windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                        info.hwndItem,
+                    )
+                    .as_bool();
+                    crate::datetime_popup::draw_field(info, &field_text(&TIME_START_VALUE), enabled);
+                }
+                ID_TIME_END => {
+                    let enabled = windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                        info.hwndItem,
+                    )
+                    .as_bool();
+                    crate::datetime_popup::draw_field(info, &field_text(&TIME_END_VALUE), enabled);
+                }
+                // 「导出」是主按钮，取消为普通按钮。
+                _ => crate::theme::draw_button_auto(info, info.CtlID as usize == ID_EXPORT_BUTTON),
+            }
+            LRESULT(1)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
@@ -297,34 +324,87 @@ unsafe fn read_range(window: HWND) -> Option<(i64, i64)> {
     }
 
     let start = if start_enabled {
-        picker_unix(window, ID_TIME_START).unwrap_or(0)
+        TIME_START_VALUE.load(Ordering::SeqCst)
     } else {
         0
     };
     let end = if end_enabled {
-        picker_unix(window, ID_TIME_END).unwrap_or(i64::MAX)
+        TIME_END_VALUE.load(Ordering::SeqCst)
     } else {
         i64::MAX
     };
     Some((start, end))
 }
 
-/// 读取一个日期时间框并转成 Unix 秒。
-unsafe fn picker_unix(window: HWND, id: usize) -> Option<i64> {
-    let control = GetDlgItem(window, id as i32).ok()?;
-    let mut system_time = SYSTEMTIME::default();
-    let result = SendMessageW(
-        control,
-        DTM_GETSYSTEMTIME,
-        WPARAM(0),
-        LPARAM(&mut system_time as *mut _ as isize),
-    )
-    .0;
-    // GDT_VALID = 0 表示取到了有效时间。
-    if result != 0 {
-        return None;
+/// 时间框上显示的文字。
+fn field_text(value: &AtomicI64) -> String {
+    let seconds = value.load(Ordering::SeqCst);
+    if seconds <= 0 {
+        String::from("未设置")
+    } else {
+        crate::util::timestamp_to_local_text(seconds)
     }
-    crate::util::local_system_time_to_unix(&system_time)
+}
+
+/// 当前 Unix 时间戳（秒）。
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 某个时间戳所在本地日期的零点。
+fn local_midnight(seconds: i64) -> i64 {
+    let local = crate::util::unix_to_local_system_time(seconds);
+    let midnight = SYSTEMTIME {
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+        ..local
+    };
+    crate::util::local_system_time_to_unix(&midnight).unwrap_or(seconds)
+}
+
+/// 点击时间框：弹出日期时间浮窗，选中后写回并自动勾选对应复选框。
+unsafe fn open_time_popup(window: HWND, id: usize) {
+    let Ok(field) = GetDlgItem(window, id as i32) else {
+        return;
+    };
+    let is_start = id == ID_TIME_START;
+    let current = if is_start {
+        TIME_START_VALUE.load(Ordering::SeqCst)
+    } else {
+        TIME_END_VALUE.load(Ordering::SeqCst)
+    };
+    let initial = if current > 0 { current } else { now_unix() };
+
+    let Some(selected) = crate::datetime_popup::show(window, field, initial) else {
+        return;
+    };
+
+    if is_start {
+        TIME_START_VALUE.store(selected, Ordering::SeqCst);
+    } else {
+        TIME_END_VALUE.store(selected, Ordering::SeqCst);
+    }
+
+    let checkbox_id = if is_start {
+        ID_TIME_START_ENABLE
+    } else {
+        ID_TIME_END_ENABLE
+    };
+    if let Ok(checkbox) = GetDlgItem(window, checkbox_id as i32) {
+        SendMessageW(
+            checkbox,
+            windows::Win32::UI::WindowsAndMessaging::BM_SETCHECK,
+            WPARAM(1),
+            LPARAM(0),
+        );
+    }
+
+    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(field, None, true);
 }
 
 /// 读取某个控件的文字（最多 1024 个宽字符）。
@@ -351,7 +431,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     // 日期时间框属于通用控件，必须先初始化（重复初始化是安全的）。
     let controls = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_LISTVIEW_CLASSES | ICC_DATE_CLASSES,
+        dwICC: ICC_LISTVIEW_CLASSES,
     };
     let _ = InitCommonControlsEx(&controls);
 
@@ -430,14 +510,22 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     create_checkbox(window, instance, ID_TIME_END_ENABLE, "止", 370, 74, 36, font);
     create_static(window, instance, "至", 348, 76, 18, 20, font);
 
-    let picker_class = wide("SysDateTimePick32");
-    let picker_format = wide("yyyy-MM-dd HH:mm:ss");
+    // 时间框改成自绘按钮：点击打开几何风格的日期时间浮窗，
+    // 不再使用会弹出系统小日历的 SysDateTimePick32。
+    let field_class = wide("BUTTON");
+    let field_style =
+        windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
+            WS_CHILD.0
+                | WS_VISIBLE.0
+                | windows::Win32::UI::WindowsAndMessaging::WS_TABSTOP.0
+                | BS_OWNERDRAW as u32,
+        );
     for (id, x) in [(ID_TIME_START, 140), (ID_TIME_END, 410)] {
-        if let Ok(picker) = CreateWindowExW(
+        if let Ok(field) = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
-            PCWSTR(picker_class.as_ptr()),
+            PCWSTR(field_class.as_ptr()),
             PCWSTR::null(),
-            WS_CHILD | WS_VISIBLE,
+            field_style,
             x,
             70,
             200,
@@ -447,16 +535,15 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
             instance,
             None,
         ) {
-            SendMessageW(picker, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-            SendMessageW(
-                picker,
-                DTM_SETFORMATW,
-                WPARAM(0),
-                LPARAM(picker_format.as_ptr() as isize),
-            );
-            remember_filter_control(picker);
+            SendMessageW(field, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            remember_filter_control(field);
         }
     }
+
+    // 默认值：起 = 今天 0 点，止 = 现在。
+    let now = now_unix();
+    TIME_START_VALUE.store(local_midnight(now), Ordering::SeqCst);
+    TIME_END_VALUE.store(now, Ordering::SeqCst);
 
     // ---- 监视类型：五个复选框 ----
     create_static(window, instance, "监视类型：", 16, 108, 80, 20, font);
@@ -499,7 +586,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         WINDOW_EX_STYLE::default(),
         PCWSTR(button_class.as_ptr()),
         PCWSTR(export_text.as_ptr()),
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32),
         420,
         300,
         90,
@@ -517,7 +604,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         WINDOW_EX_STYLE::default(),
         PCWSTR(button_class.as_ptr()),
         PCWSTR(cancel_text.as_ptr()),
-        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32),
         520,
         300,
         90,
@@ -529,6 +616,9 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     ) {
         SendMessageW(button, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
     }
+
+    // 复选框 / 单选框统一换成几何风格的自绘外观。
+    crate::theme::style_children(window);
 }
 
 /// 记住一个需要随「筛选」开关一起启停的控件。
@@ -659,3 +749,4 @@ unsafe fn create_static(
         SendMessageW(handle, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
     }
 }
+

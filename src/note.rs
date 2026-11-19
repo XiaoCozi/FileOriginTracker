@@ -17,7 +17,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowTextW,
     IsWindow, LoadCursorW, RegisterClassExW, SendMessageW, SetWindowTextW, ShowWindow,
     TranslateMessage, CW_USEDEFAULT, HMENU, IDC_ARROW, MSG, SW_SHOWNORMAL, WINDOW_EX_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_SETFONT, WNDCLASSEXW,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_SETFONT,
+    WNDCLASSEXW,
     WS_BORDER, WS_CAPTION, WS_CHILD, WS_SYSMENU, WS_VISIBLE,
 };
 
@@ -185,9 +186,15 @@ unsafe extern "system" fn window_procedure(
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
             // 让标签和输入框背景与窗口一致（白色），避免出现灰色块。
             let device = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
-            SetBkColor(device, windows::Win32::Foundation::COLORREF(0x00FF_FFFF));
-            SetTextColor(device, windows::Win32::Foundation::COLORREF(0x0020_2020));
+            SetBkColor(device, crate::theme::BG);
+            SetTextColor(device, crate::theme::TEXT);
             LRESULT(crate::util::ui_brush().0 as isize)
+        }
+        WM_DRAWITEM => {
+            // 「保存」为主按钮，其余为普通平面按钮。
+            let info = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+            crate::theme::draw_button_auto(info, info.CtlID as usize == ID_SAVE_BUTTON);
+            LRESULT(1)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
@@ -246,7 +253,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
             WS_CHILD
                 | WS_VISIBLE
                 | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
-                    windows::Win32::UI::WindowsAndMessaging::BS_PUSHBUTTON as u32,
+                    windows::Win32::UI::WindowsAndMessaging::BS_OWNERDRAW as u32,
                 ),
             x,
             120,

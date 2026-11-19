@@ -19,8 +19,7 @@
 //! 因此浮窗打开期间不会误操作后面的记录列表。
 
 use once_cell::sync::Lazy;
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use windows::core::PCWSTR;
@@ -28,11 +27,9 @@ use windows::Win32::Foundation::{
     COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SYSTEMTIME, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush,
-    DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, HGDIOBJ, HDC, HFONT, PAINTSTRUCT,
-    SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
-    OUT_DEFAULT_PRECIS, SRCCOPY, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EndPaint,
+    HGDIOBJ, HDC, PAINTSTRUCT, SRCCOPY, SelectObject, DT_CENTER, DT_LEFT, DT_SINGLELINE,
+    DT_VCENTER,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
@@ -46,6 +43,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOPMOST, WS_POPUP,
 };
 
+// 调色板、字体和绘制函数统一来自 theme 模块，
+// 这样日期浮窗和其它窗口的观感完全一致（正文 9pt、标题 11pt 加粗）。
+use crate::theme::{
+    body_font, bold_font, draw_text, fill, frame, small_font, title_font, ACCENT, ACCENT_HOVER,
+    ACCENT_SOFT, BG, BORDER, BORDER_SOFT, FAINT, MUTED, PANEL, TEXT,
+};
 use crate::util::wide;
 
 /// 窗口类名。注册一次后重复使用。
@@ -89,35 +92,6 @@ const TIME_GROUP_GAP: i32 = 12;
 /// 底部按钮行。
 const FOOTER_Y: i32 = 408;
 const FOOTER_H: i32 = 36;
-
-// ===== 调色板 =====
-//
-// COLORREF 的字节顺序是 0x00BBGGRR（蓝、绿、红），不是常见的 RGB，
-// 所以用这个 const 函数把习惯的 RGB 顺序转换成 Windows 需要的格式。
-const fn rgb(red: u32, green: u32, blue: u32) -> COLORREF {
-    COLORREF(red | (green << 8) | (blue << 16))
-}
-
-/// 浮窗背景（纯白）。
-const BG: COLORREF = rgb(255, 255, 255);
-/// 浅灰面板色，用于未选中的按钮和数值框。
-const PANEL: COLORREF = rgb(247, 248, 250);
-/// 常规描边色。
-const BORDER: COLORREF = rgb(216, 220, 229);
-/// 更淡的描边，用于内部数值框。
-const BORDER_SOFT: COLORREF = rgb(235, 237, 241);
-/// 主要文字色（近黑）。
-const TEXT: COLORREF = rgb(31, 35, 41);
-/// 次要文字色（灰）。
-const MUTED: COLORREF = rgb(140, 146, 156);
-/// 相邻月份的日期文字色（更淡）。
-const FAINT: COLORREF = rgb(190, 195, 204);
-/// 强调色：选中日期、确定按钮、焦点描边都用它。
-const ACCENT: COLORREF = rgb(47, 107, 255);
-/// 强调色的浅色填充（悬停）。
-const ACCENT_SOFT: COLORREF = rgb(234, 241, 255);
-/// 强调色的深一点的填充（按钮按下感）。
-const ACCENT_HOVER: COLORREF = rgb(214, 226, 255);
 
 /// 虚函数键码（winuser.h），只用到这几个。
 const VK_ESCAPE: u32 = 0x1B;
@@ -202,12 +176,6 @@ impl State {
 static STATE: Lazy<Mutex<State>> = Lazy::new(|| Mutex::new(State::empty()));
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-/// 四套字体句柄（标题 / 粗体 / 正文 / 小字），首次打开时创建、进程结束前复用。
-static FONT_TITLE: AtomicIsize = AtomicIsize::new(0);
-static FONT_BOLD: AtomicIsize = AtomicIsize::new(0);
-static FONT_BODY: AtomicIsize = AtomicIsize::new(0);
-static FONT_SMALL: AtomicIsize = AtomicIsize::new(0);
-
 /// 打开日期时间浮窗，返回用户选中的 Unix 秒数。
 ///
 /// - `owner`：父窗口，浮窗打开期间会被禁用（模态效果）
@@ -238,7 +206,6 @@ pub fn show(owner: HWND, anchor: HWND, initial_unix: i64) -> Option<i64> {
     if !register_class(instance) {
         return None;
     }
-    ensure_fonts();
 
     // 默认显示在时间框正下方；屏幕下方放不下时翻到上方，并保证不超出屏幕。
     let (x, y) = popup_position(anchor)?;
@@ -1173,90 +1140,6 @@ struct Snapshot {
     hot: Hit,
 }
 
-/// 纯色填充一个矩形。
-unsafe fn fill(hdc: HDC, rect: &RECT, color: COLORREF) {
-    let brush = CreateSolidBrush(color);
-    FillRect(hdc, rect, brush);
-    // 画刷用完立即释放，避免每帧累积 GDI 对象。
-    let _ = DeleteObject(HGDIOBJ(brush.0));
-}
-
-/// 只用 1 像素细线描边（四个长条拼成）。
-///
-/// 不用 `Rectangle()` 是因为它会带上当前画笔和画刷，容易画出多余的填充；
-/// 这里直接铺色块，效果稳定，也符合“几何线条”的观感。
-unsafe fn frame(hdc: HDC, rect: &RECT, color: COLORREF) {
-    fill(
-        hdc,
-        &RECT {
-            left: rect.left,
-            top: rect.top,
-            right: rect.right,
-            bottom: rect.top + 1,
-        },
-        color,
-    );
-    fill(
-        hdc,
-        &RECT {
-            left: rect.left,
-            top: rect.bottom - 1,
-            right: rect.right,
-            bottom: rect.bottom,
-        },
-        color,
-    );
-    fill(
-        hdc,
-        &RECT {
-            left: rect.left,
-            top: rect.top + 1,
-            right: rect.left + 1,
-            bottom: rect.bottom - 1,
-        },
-        color,
-    );
-    fill(
-        hdc,
-        &RECT {
-            left: rect.right - 1,
-            top: rect.top + 1,
-            right: rect.right,
-            bottom: rect.bottom - 1,
-        },
-        color,
-    );
-}
-
-/// 画一行文字。
-///
-/// `flags` 用 `DT_*` 常量组合（居中对齐、垂直居中、单行）。
-unsafe fn draw_text(
-    hdc: HDC,
-    value: &str,
-    rect: &mut RECT,
-    flags: u32,
-    color: COLORREF,
-    font: HFONT,
-) {
-    let previous = SelectObject(hdc, HGDIOBJ(font.0));
-    SetTextColor(hdc, color);
-    // 透明背景，否则文字周围会出现一块底色。
-    SetBkMode(hdc, TRANSPARENT);
-
-    let mut buffer = wide(value);
-    // 去掉结尾的 0，DrawTextW 自己按长度处理。
-    let length = buffer.len().saturating_sub(1);
-    DrawTextW(
-        hdc,
-        &mut buffer[..length],
-        rect,
-        DRAW_TEXT_FORMAT(flags),
-    );
-
-    SelectObject(hdc, previous);
-}
-
 /// 时间框右侧的小日历图标：一个方框 + 顶部条 + 三个小方块。
 unsafe fn draw_calendar_glyph(hdc: HDC, x: i32, y: i32, color: COLORREF) {
     frame(
@@ -1291,58 +1174,6 @@ unsafe fn draw_calendar_glyph(hdc: HDC, x: i32, y: i32, color: COLORREF) {
             color,
         );
     }
-}
-
-// ===== 字体 =====
-
-/// 首次打开时创建四套字体；之后直接复用。
-fn ensure_fonts() {
-    if FONT_BODY.load(Ordering::SeqCst) != 0 {
-        return;
-    }
-    unsafe {
-        FONT_TITLE.store(create_font(-20, 600).0 as isize, Ordering::SeqCst);
-        FONT_BOLD.store(create_font(-18, 600).0 as isize, Ordering::SeqCst);
-        FONT_BODY.store(create_font(-18, 400).0 as isize, Ordering::SeqCst);
-        FONT_SMALL.store(create_font(-14, 400).0 as isize, Ordering::SeqCst);
-    }
-}
-
-/// 创建「微软雅黑 UI」字体。`height` 为负表示字符高度（像素）。
-unsafe fn create_font(height: i32, weight: i32) -> HFONT {
-    let face = wide("Microsoft YaHei UI");
-    CreateFontW(
-        height,
-        0,
-        0,
-        0,
-        weight,
-        0,
-        0,
-        0,
-        DEFAULT_CHARSET.0 as u32,
-        OUT_DEFAULT_PRECIS.0 as u32,
-        CLIP_DEFAULT_PRECIS.0 as u32,
-        CLEARTYPE_QUALITY.0 as u32,
-        DEFAULT_PITCH.0 as u32,
-        PCWSTR(face.as_ptr()),
-    )
-}
-
-fn title_font() -> HFONT {
-    HFONT(FONT_TITLE.load(Ordering::SeqCst) as *mut c_void)
-}
-
-fn bold_font() -> HFONT {
-    HFONT(FONT_BOLD.load(Ordering::SeqCst) as *mut c_void)
-}
-
-fn body_font() -> HFONT {
-    HFONT(FONT_BODY.load(Ordering::SeqCst) as *mut c_void)
-}
-
-fn small_font() -> HFONT {
-    HFONT(FONT_SMALL.load(Ordering::SeqCst) as *mut c_void)
 }
 
 // ===== 小工具 =====
