@@ -7,7 +7,8 @@
 //!
 //! 交互：
 //! - 顶部同一行工具栏：搜索框（按程序名 / 路径 / 类型实时过滤）+「起 / 止」两个
-//!   复选框与时间框（勾上才按该端时间过滤，精确到秒）
+//!   复选框与时间框（勾上才按该端时间过滤，精确到秒）。时间框是自绘控件，
+//!   点击后弹出几何风格的日期时间浮窗，可以在同一个浮窗里同时选日期和时分秒
 //! - 点击列头按该列排序，再点一次切换升序 / 降序
 //! - 「类型」列按记录种类显示彩色底：新建文件=天蓝、新建文件夹=青绿、
 //!   修改文件=浅紫、删除文件=红、删除文件夹=橙
@@ -18,7 +19,7 @@
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{PCWSTR, PWSTR};
@@ -35,7 +36,7 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, BST_CHECKED, BST_UNCHECKED, CDDS_ITEMPREPAINT, CDDS_PREPAINT,
     CDDS_SUBITEM, CDRF_DODEFAULT, CDRF_NEWFONT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW,
-    DTM_GETSYSTEMTIME, DTM_SETFORMATW, ICC_DATE_CLASSES, ICC_LISTVIEW_CLASSES,
+    DRAWITEMSTRUCT, ICC_LISTVIEW_CLASSES,
     INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
     LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
     LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNW,
@@ -50,12 +51,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetMessageW, GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MessageBoxW,
     MoveWindow, PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer,
     SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK,
-    BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL,
+    BS_AUTOCHECKBOX, BS_OWNERDRAW, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, HMENU, ICON_BIG,
+    ICON_SMALL,
     IDC_ARROW, MB_ICONINFORMATION, MB_OK, MF_BYPOSITION, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL,
     TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_NOTIFY,
-    WM_NULL, WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER,
-    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM,
+    WM_NOTIFY, WM_NULL, WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSEXW,
+    WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::db::{Database, FileOrigin};
@@ -88,9 +90,17 @@ const LIST_STYLE: windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE =
 static HISTORY_WINDOW: AtomicIsize = AtomicIsize::new(0);
 static LIST_VIEW: AtomicIsize = AtomicIsize::new(0);
 static SEARCH_EDIT: AtomicIsize = AtomicIsize::new(0);
-/// 时间筛选的两个日期时间框（DateTimePicker）。
-static FILTER_START_PICKER: AtomicIsize = AtomicIsize::new(0);
-static FILTER_END_PICKER: AtomicIsize = AtomicIsize::new(0);
+/// 时间筛选的两个时间框（自绘按钮）。
+///
+/// 点击后打开 `datetime_popup` 里的几何风格浮窗，取代系统自带的
+/// 那个又挤又丑的下拉日历。
+static FILTER_START_FIELD: AtomicIsize = AtomicIsize::new(0);
+static FILTER_END_FIELD: AtomicIsize = AtomicIsize::new(0);
+/// 起、止两端当前选中的 Unix 时间戳（秒）。
+///
+/// 时间框的显示文字直接由它生成；复选框没勾选时它只是“待用值”。
+static FILTER_START_VALUE: AtomicI64 = AtomicI64::new(0);
+static FILTER_END_VALUE: AtomicI64 = AtomicI64::new(0);
 /// 起、止两端各自是否启用（对应时间框左边的复选框）。
 static FILTER_START_ENABLE: AtomicIsize = AtomicIsize::new(0);
 static FILTER_END_ENABLE: AtomicIsize = AtomicIsize::new(0);
@@ -122,7 +132,8 @@ const COLUMNS: [(&str, i32); 5] = [
 const LIST_CONTROL_ID: usize = 1;
 /// 搜索框的子窗口 ID。WM_COMMAND 里靠它区分搜索框的输入事件。
 const SEARCH_CONTROL_ID: usize = 2;
-/// 时间筛选控件 ID：起、止两个日期时间框和一个「清除筛选」按钮。
+/// 时间筛选控件 ID：起、止两个时间框和一个「清除筛选」按钮。
+/// 两个时间框是自绘按钮，点击会弹出日期时间浮窗。
 const FILTER_START_PICKER_ID: usize = 3;
 const FILTER_END_PICKER_ID: usize = 4;
 const FILTER_CLEAR_BUTTON_ID: usize = 5;
@@ -150,11 +161,6 @@ const MENU_COPY_ENTRY: u32 = 4002;
 const MENU_OPEN_PROGRAM_DIR: u32 = 4003;
 const MENU_SET_NOTE: u32 = 4004;
 const MENU_ADD_TO_LIST: u32 = 4005;
-
-/// 日期时间框的值变化通知码（winuser.h 里的 DTN_DATETIMECHANGE = 0U-759U）。
-const DTN_DATETIMECHANGE_CODE: u32 = 0xFFFF_FD09;
-/// DTM_GETSYSTEMTIME 的返回码：0 表示拿到了有效时间。
-const GDT_VALID: isize = 0;
 
 /// 各列的列下标（0 起），与 `COLUMNS` 的顺序一一对应。
 const DATE_COLUMN: i32 = 0;
@@ -365,8 +371,13 @@ unsafe extern "system" fn window_procedure(
                 _ if id == FILTER_CLEAR_BUTTON_ID as u32 => {
                     clear_time_filter();
                 }
-                // 「起 / 止」复选框被点击：按新的勾选状态立即刷新列表。
+                // 点击「起 / 止」时间框：打开几何风格日期时间浮窗。
+                _ if id == FILTER_START_PICKER_ID as u32 || id == FILTER_END_PICKER_ID as u32 => {
+                    open_time_popup(hwnd, id as usize);
+                }
+                // 「起 / 止」复选框被点击：重绘时间框（启用 / 禁用外观）并刷新列表。
                 _ if id == FILTER_START_ENABLE_ID as u32 || id == FILTER_END_ENABLE_ID as u32 => {
+                    repaint_filter_fields();
                     reload_list();
                 }
                 // ---- 右键菜单命令 ----
@@ -414,14 +425,6 @@ unsafe extern "system" fn window_procedure(
         }
         WM_NOTIFY => {
             let header = &*(lparam.0 as *const NMHDR);
-
-            // 时间筛选：任一日期时间框被勾选 / 修改时间，立即重新查询并刷新列表。
-            if (header.idFrom == FILTER_START_PICKER_ID || header.idFrom == FILTER_END_PICKER_ID)
-                && header.code == DTN_DATETIMECHANGE_CODE
-            {
-                refresh_list();
-                return LRESULT(0);
-            }
 
             if header.idFrom == LIST_CONTROL_ID {
                 let list = HWND(LIST_VIEW.load(Ordering::SeqCst) as *mut c_void);
@@ -477,6 +480,30 @@ unsafe extern "system" fn window_procedure(
             }
             LRESULT(0)
         }
+        WM_DRAWITEM => {
+            // 自绘「起 / 止」时间框。
+            //
+            // 这两个控件是 BS_OWNERDRAW 按钮，长什么样完全由我们决定：
+            // 平面白底 + 细描边 + 右侧日历图标，和系统默认的下拉框区分开。
+            let info = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            if info.CtlID as usize == FILTER_START_PICKER_ID {
+                crate::datetime_popup::draw_field(
+                    info,
+                    &field_text(&FILTER_START_VALUE),
+                    checkbox_checked(&FILTER_START_ENABLE),
+                );
+                return LRESULT(1);
+            }
+            if info.CtlID as usize == FILTER_END_PICKER_ID {
+                crate::datetime_popup::draw_field(
+                    info,
+                    &field_text(&FILTER_END_VALUE),
+                    checkbox_checked(&FILTER_END_ENABLE),
+                );
+                return LRESULT(1);
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
             // 让「搜索」标签和搜索框背景与窗口一致（白色），
             // 否则系统会画出默认的灰色背景，和白色窗口拼在一起很突兀。
@@ -523,8 +550,8 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     // 列表控件属于通用控件，必须先初始化。
     let controls = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-        // 列表控件 + 日期时间选择框都属于通用控件，必须先初始化。
-        dwICC: ICC_LISTVIEW_CLASSES | ICC_DATE_CLASSES,
+        // 只需要初始化列表控件；时间框已经换成自绘控件，不再需要日期时间通用控件。
+        dwICC: ICC_LISTVIEW_CLASSES,
     };
     let _ = InitCommonControlsEx(&controls);
 
@@ -646,20 +673,24 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         }
     }
 
-    // 日期时间框统一格式：年月日时分秒，方便精确到某一秒。
-    let picker_class = wide("SysDateTimePick32");
-    let picker_format = wide("yyyy-MM-dd HH:mm:ss");
-    // 不使用 DTS_SHOWNONE：时间框里不再内嵌小勾选框，是否启用由左边的复选框决定。
-    let picker_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0);
+    // ===== 时间框（自绘按钮） =====
+    //
+    // 系统自带的 SysDateTimePick32 弹出的日历又小又挤，而且选时间要靠键盘。
+    // 这里改成 BS_OWNERDRAW 按钮：外观由 datetime_popup::draw_field 绘制，
+    // 点击时打开自定义的几何风格日期时间浮窗（日历 + 时分秒）。
+    let button_class = wide("BUTTON");
+    let field_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32);
 
-    // 宽度 190：刚好容纳「2026-11-16 22:08:31」19 个字符 + 右侧下拉箭头，
-    // 小于 190 时最后的秒数会被裁掉。
-    for (id, x) in [(FILTER_START_PICKER_ID, 418), (FILTER_END_PICKER_ID, 680)] {
-        if let Ok(picker) = CreateWindowExW(
+    // 宽度 190：容纳「2026-11-16 22:08:31」19 个字符 + 右侧日历图标。
+    for (id, x, target) in [
+        (FILTER_START_PICKER_ID, 418, &FILTER_START_FIELD),
+        (FILTER_END_PICKER_ID, 680, &FILTER_END_FIELD),
+    ] {
+        if let Ok(field) = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
-            PCWSTR(picker_class.as_ptr()),
+            PCWSTR(button_class.as_ptr()),
             PCWSTR::null(),
-            picker_style,
+            field_style,
             x,
             8,
             190,
@@ -669,21 +700,18 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
             instance,
             None,
         ) {
-            // 记住句柄，刷新 / 清除筛选时按句柄读写时间。
-            if id == FILTER_START_PICKER_ID {
-                FILTER_START_PICKER.store(picker.0 as isize, Ordering::SeqCst);
-            } else {
-                FILTER_END_PICKER.store(picker.0 as isize, Ordering::SeqCst);
-            }
-            SendMessageW(picker, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-            SendMessageW(
-                picker,
-                DTM_SETFORMATW,
-                WPARAM(0),
-                LPARAM(picker_format.as_ptr() as isize),
-            );
+            // 记住句柄：点击时用它作为浮窗的定位基准，重绘时也用它。
+            target.store(field.0 as isize, Ordering::SeqCst);
+            SendMessageW(field, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
         }
     }
+
+    // 两端默认值：起 = 今天 00:00:00，止 = 当前时间。
+    // 复选框没勾选时这些值只用于显示，勾选后才真正参与筛选。
+    let now = current_unix();
+    FILTER_START_VALUE.store(local_midnight(now), Ordering::SeqCst);
+    FILTER_END_VALUE.store(now, Ordering::SeqCst);
+    repaint_filter_fields();
 
     // 「至」：连接起止两个时间框。
     let to_text = wide("至");
@@ -706,7 +734,6 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
 
     // 「清除筛选」：去掉两个复选框的勾选，恢复显示全部记录。
     let clear_text = wide("清除筛选");
-    let button_class = wide("BUTTON");
     if let Ok(clear_button) = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         PCWSTR(button_class.as_ptr()),
@@ -1209,21 +1236,19 @@ fn checkbox_checked(checkbox: &AtomicIsize) -> bool {
     state == BST_CHECKED.0
 }
 
-/// 读取两个时间框，得到「起 / 止」的 Unix 秒范围。
+/// 读取两个时间框的当前值，得到「起 / 止」的 Unix 秒范围。
 ///
 /// - 两端复选框都没勾选：返回 `None`（不筛选）
 /// - 只勾选了一个：另一端用极小 / 极大值表示“不限”
 /// - 起止顺序反了：自动交换，避免用户手滑后列表空白
 fn time_filter_range() -> Option<(i64, i64)> {
     let start = if checkbox_checked(&FILTER_START_ENABLE) {
-        picker_time(HWND(
-            FILTER_START_PICKER.load(Ordering::SeqCst) as *mut c_void
-        ))
+        Some(FILTER_START_VALUE.load(Ordering::SeqCst))
     } else {
         None
     };
     let end = if checkbox_checked(&FILTER_END_ENABLE) {
-        picker_time(HWND(FILTER_END_PICKER.load(Ordering::SeqCst) as *mut c_void))
+        Some(FILTER_END_VALUE.load(Ordering::SeqCst))
     } else {
         None
     };
@@ -1240,47 +1265,108 @@ fn time_filter_range() -> Option<(i64, i64)> {
     }
 }
 
-/// 读取一个日期时间框里的时间，转成 Unix 秒。
-///
-/// 返回 `None` 表示这个框没被勾选（DTS_SHOWNONE 的复选框是空的），也就是“不限时间”。
-fn picker_time(picker: HWND) -> Option<i64> {
-    if picker.0.is_null() {
-        return None;
+/// 时间框上显示的文字，例如 `2026-11-19 22:04:02`。
+fn field_text(value: &AtomicI64) -> String {
+    let seconds = value.load(Ordering::SeqCst);
+    if seconds <= 0 {
+        String::from("未设置")
+    } else {
+        crate::util::timestamp_to_local_text(seconds)
     }
-
-    let mut system_time = SYSTEMTIME::default();
-    let result = unsafe {
-        SendMessageW(
-            picker,
-            DTM_GETSYSTEMTIME,
-            WPARAM(0),
-            LPARAM(&mut system_time as *mut _ as isize),
-        )
-    }
-    .0 as isize;
-    if result != GDT_VALID {
-        return None;
-    }
-
-    // 日期时间框给的是本地时间，交给 util 换算成和数据库一致的 Unix 时间戳。
-    crate::util::local_system_time_to_unix(&system_time)
 }
 
-/// 清除时间筛选：取消两端的勾选，再重新读取全部记录。
-fn clear_time_filter() {
-    for checkbox in [&FILTER_START_ENABLE, &FILTER_END_ENABLE] {
-        let hwnd = HWND(checkbox.load(Ordering::SeqCst) as *mut c_void);
+/// 让两个时间框重新绘制（数值变了、启用状态变了都要调用）。
+fn repaint_filter_fields() {
+    for handle in [&FILTER_START_FIELD, &FILTER_END_FIELD] {
+        let hwnd = HWND(handle.load(Ordering::SeqCst) as *mut c_void);
         if !hwnd.0.is_null() {
             unsafe {
-                SendMessageW(
-                    hwnd,
-                    BM_SETCHECK,
-                    WPARAM(BST_UNCHECKED.0 as usize),
-                    LPARAM(0),
-                );
+                let _ = InvalidateRect(hwnd, None, true);
             }
         }
     }
+}
+
+/// 勾选 / 取消勾选一个复选框。
+fn set_checkbox(handle: &AtomicIsize, checked: bool) {
+    let hwnd = HWND(handle.load(Ordering::SeqCst) as *mut c_void);
+    if hwnd.0.is_null() {
+        return;
+    }
+    let state = if checked {
+        BST_CHECKED
+    } else {
+        BST_UNCHECKED
+    };
+    unsafe {
+        SendMessageW(hwnd, BM_SETCHECK, WPARAM(state.0 as usize), LPARAM(0));
+    }
+}
+
+/// 点击「起」或「止」时间框：打开日期时间浮窗。
+///
+/// 用户按下「确定」后，把选中的时间写回对应的一端，并自动勾选复选框
+/// （“选了时间就是要筛选”，省得再点一次复选框）。
+fn open_time_popup(owner: HWND, control_id: usize) {
+    let is_start = control_id == FILTER_START_PICKER_ID;
+    let (field_handle, value_handle, enable_handle) = if is_start {
+        (&FILTER_START_FIELD, &FILTER_START_VALUE, &FILTER_START_ENABLE)
+    } else {
+        (&FILTER_END_FIELD, &FILTER_END_VALUE, &FILTER_END_ENABLE)
+    };
+
+    let field = HWND(field_handle.load(Ordering::SeqCst) as *mut c_void);
+    if field.0.is_null() {
+        return;
+    }
+
+    let current = value_handle.load(Ordering::SeqCst);
+    let initial = if current > 0 { current } else { current_unix() };
+
+    let Some(selected) = crate::datetime_popup::show(owner, field, initial) else {
+        return;
+    };
+
+    value_handle.store(selected, Ordering::SeqCst);
+    set_checkbox(enable_handle, true);
+    repaint_filter_fields();
+    reload_list();
+}
+
+/// 当前 Unix 时间戳（秒）。
+fn current_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 某个时间戳所在「本地日期」的零点，例如 2026-11-19 00:00:00。
+///
+/// 「起」的默认值用它，这样勾上「起」就表示“从今天 0 点开始”。
+fn local_midnight(seconds: i64) -> i64 {
+    let local = crate::util::unix_to_local_system_time(seconds);
+    let midnight = SYSTEMTIME {
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+        ..local
+    };
+    crate::util::local_system_time_to_unix(&midnight).unwrap_or(seconds)
+}
+
+/// 清除时间筛选：取消两端的勾选，把默认值重置为“今天 0 点 / 现在”，
+/// 再重新读取全部记录。
+fn clear_time_filter() {
+    set_checkbox(&FILTER_START_ENABLE, false);
+    set_checkbox(&FILTER_END_ENABLE, false);
+
+    let now = current_unix();
+    FILTER_START_VALUE.store(local_midnight(now), Ordering::SeqCst);
+    FILTER_END_VALUE.store(now, Ordering::SeqCst);
+
+    repaint_filter_fields();
     reload_list();
 }
 

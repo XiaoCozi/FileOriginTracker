@@ -213,6 +213,39 @@ pub fn local_system_time_to_unix(system_time: &SYSTEMTIME) -> Option<i64> {
     Some(ticks / 10_000_000 - SECONDS_BETWEEN_1601_AND_1970)
 }
 
+/// 把 Unix 时间戳（秒）转换为「本地时间」的 SYSTEMTIME。
+///
+/// 这是 [`local_system_time_to_unix`] 的反向操作，供自定义日期时间选择浮窗使用：
+/// 浮窗拿到的是数据库里的 Unix 秒数，需要先拆成本地时间的年 / 月 / 日 / 时 / 分 / 秒
+/// 才能画在日历格子和时间调节器上。
+///
+/// 任何一步转换失败时退回系统当前时间，保证调用方永远拿到一个可用的值。
+pub fn unix_to_local_system_time(unix_seconds: i64) -> SYSTEMTIME {
+    // 1601-01-01 到 1970-01-01 之间的秒数差
+    const SECONDS_BETWEEN_1601_AND_1970: i64 = 11_644_473_600;
+
+    let mut system_time = SYSTEMTIME::default();
+
+    // 先拼出 FILETIME（100 纳秒为单位），再依次转成本地时间、SYSTEMTIME。
+    if let Some(ticks) = (unix_seconds + SECONDS_BETWEEN_1601_AND_1970).checked_mul(10_000_000) {
+        let file_time = FILETIME {
+            dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
+        let mut local_time = FILETIME::default();
+        unsafe {
+            if FileTimeToLocalFileTime(&file_time, &mut local_time).is_ok()
+                && FileTimeToSystemTime(&local_time, &mut system_time).is_ok()
+            {
+                return system_time;
+            }
+        }
+    }
+
+    // 时间戳超出可表示范围时返回全零结构，调用方会按“未设置”处理。
+    system_time
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

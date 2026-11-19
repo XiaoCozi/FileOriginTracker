@@ -10,6 +10,7 @@ pub mod about;
 pub mod com;
 pub mod config;
 pub mod db;
+pub mod datetime_popup;
 pub mod etw;
 pub mod export_dialog;
 pub mod history;
