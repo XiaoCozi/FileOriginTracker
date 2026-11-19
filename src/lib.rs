@@ -11,6 +11,7 @@ pub mod com;
 pub mod config;
 pub mod db;
 pub mod etw;
+pub mod export_dialog;
 pub mod history;
 pub mod list_rules;
 pub mod list_window;

@@ -1,6 +1,6 @@
 [package]
 name = "file-origin-tracker"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["葱籽"]
 description = "后台追踪文件/文件夹来自哪个程序创建的 Windows 系统工具"
@@ -44,6 +44,8 @@ windows = { version = "0.58", features = [
     # 文件选择对话框（添加程序到黑白名单）
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_WindowsAndMessaging",
+    # 启用 / 禁用控件用的 EnableWindow
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Com",
     "Win32_System_SystemServices",
     # 复制词条到剪贴板需要数据交换（剪贴板）与全局内存分配

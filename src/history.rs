@@ -1542,17 +1542,24 @@ fn action_label(action: &str) -> String {
     }
 }
 
-/// 把当前列表里的记录导出成 Excel（.xlsx）表格。
+/// 导出 Excel 的完整流程。
 ///
-/// 「筛选导出」的含义：导出内容就是**屏幕上看到的这批记录**——
-/// 已经按搜索框关键字和时间范围过滤、也保持了当前列排序。
-/// 所以想把全部记录导出去，先点「清除筛选」，再点导出即可。
-/// 实现上直接读内存里的 `ROW_CACHE`，不会再查一次数据库，开销只有写文件本身。
+/// 一共三步：
+/// 1. 弹出条件窗口，让用户选择「导出全部」或「按条件筛选导出」；
+/// 2. 按所选条件从数据库查询记录（不受列表 500 条上限限制）；
+/// 3. 让用户选择保存位置并写出 `.xlsx`。
 unsafe fn export_to_excel(window: HWND) {
-    // 取一份当前列表的副本，避免写文件期间列表被定时刷新改动。
-    let rows: Vec<FileOrigin> = match ROW_CACHE.lock() {
-        Ok(cache) => cache.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
+    // 第一步：条件窗口。用户点「取消」时返回 None，直接结束。
+    let Some(scope) = crate::export_dialog::show(window) else {
+        return;
+    };
+
+    // 第二步：查库。「导出全部」等价于所有条件都留空。
+    let rows: Vec<FileOrigin> = match scope {
+        crate::export_dialog::ExportScope::All => {
+            query_for_export(&crate::db::RecordFilter::default())
+        }
+        crate::export_dialog::ExportScope::Filter(filter) => query_for_export(&filter),
     };
 
     if rows.is_empty() {
@@ -1600,6 +1607,30 @@ unsafe fn export_to_excel(window: HWND) {
             log::error!("导出 Excel 失败：{}", error);
         }
     }
+}
+
+/// 按给定条件从数据库读取记录（不限条数），供导出使用。
+///
+/// 和 `load_rows` 的区别：这里不套用列表的 500 条上限，
+/// 也不受列表当前排序影响，导出的就是数据库里符合条件的全部数据。
+fn query_for_export(filter: &crate::db::RecordFilter) -> Vec<FileOrigin> {
+    let mut guard = match HISTORY_DB.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if guard.is_none() {
+        if let Ok(data_dir) = crate::config::Config::default_data_dir() {
+            if let Ok(db) = Database::open_readonly(&data_dir) {
+                *guard = Some(db);
+            }
+        }
+    }
+
+    guard
+        .as_ref()
+        .and_then(|db| db.query_records(filter).ok())
+        .unwrap_or_default()
 }
 
 /// 弹出系统的「另存为」对话框，返回用户选择的保存路径。

@@ -150,6 +150,24 @@ fn quarantine_database(db_path: &Path) {
     );
 }
 
+/// 导出时使用的筛选条件。
+///
+/// 所有字段留空（空字符串 / 空列表 / `None`）都表示「该条件不限」，
+/// 因此 `RecordFilter::default()` 等价于「导出全部记录」。
+#[derive(Debug, Clone, Default)]
+pub struct RecordFilter {
+    /// 创建程序：模糊匹配进程名或程序完整路径。
+    pub program: String,
+    /// 关键字：模糊匹配文件路径或程序名。
+    pub keyword: String,
+    /// 备注：模糊匹配程序备注。
+    pub note: String,
+    /// 监视类型列表（`create_file` / `create_dir` / `modify` / `delete_file` / `delete_dir`）。
+    pub actions: Vec<String>,
+    /// 时间范围（Unix 秒，闭区间）。
+    pub range: Option<(i64, i64)>,
+}
+
 impl Database {
     /// 初始化数据库（创建连接 + 建表）
     pub fn init(data_dir: &Path) -> Result<Self> {
@@ -499,8 +517,132 @@ impl Database {
         Ok(result)
     }
 
-    /// 按程序汇总五类事件的数量，供「程序统计」窗口使用。
+    /// 按筛选条件查询**全部**匹配记录，供「导出 Excel」使用。
     ///
+    /// 和 `recent_filtered` 的区别：
+    /// - 不带 `LIMIT`，导出的是完整结果，不会被 500 条上限截断；
+    /// - 支持按程序、关键字、备注、监视类型、时间范围组合筛选。
+    ///
+    /// 所有条件都用 `?` 占位符传参，不做字符串拼接，避免 SQL 注入。
+    pub fn query_records(&self, filter: &RecordFilter) -> Result<Vec<FileOrigin> > {
+        let conn = self.lock_connection();
+
+        // 先用一个和 recent_filtered 完全一致的 UNION 视图把三类数据合并，
+        // 再按需往 WHERE 后面追加条件。
+        let mut sql = String::from(
+            r#"
+            SELECT t.file_path, t.process_name, t.process_path, t.created_at, t.action,
+                   COALESCE(n.note, '')
+            FROM (
+                SELECT file_path, process_name, process_path, created_at,
+                       CASE WHEN is_directory <> 0 THEN 'create_dir' ELSE 'create_file' END AS action
+                FROM file_origins
+                UNION ALL
+                SELECT file_path, process_name, process_path, modified_at AS created_at,
+                       'modify' AS action
+                FROM file_modifications
+                UNION ALL
+                SELECT file_path, process_name, process_path, deleted_at AS created_at,
+                       CASE WHEN is_directory <> 0 THEN 'delete_dir' ELSE 'delete_file' END AS action
+                FROM file_deletions
+            ) AS t
+            LEFT JOIN program_notes n ON n.process_path = t.process_path
+            WHERE t.file_path <> '' AND t.process_name <> '' AND t.process_path <> ''
+            "#,
+        );
+
+        // 动态参数按追加顺序收集，和 SQL 里的 ? 一一对应。
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        let program = filter.program.trim();
+        if !program.is_empty() {
+            sql.push_str(" AND (t.process_name LIKE ? OR t.process_path LIKE ?)");
+            let pattern = format!("%{}%", program);
+            args.push(Box::new(pattern.clone()));
+            args.push(Box::new(pattern));
+        }
+
+        let keyword = filter.keyword.trim();
+        if !keyword.is_empty() {
+            sql.push_str(" AND (t.file_path LIKE ? OR t.process_name LIKE ?)");
+            let pattern = format!("%{}%", keyword);
+            args.push(Box::new(pattern.clone()));
+            args.push(Box::new(pattern));
+        }
+
+        let note = filter.note.trim();
+        if !note.is_empty() {
+            sql.push_str(" AND COALESCE(n.note, '') LIKE ?");
+            args.push(Box::new(format!("%{}%", note)));
+        }
+
+        if !filter.actions.is_empty() {
+            // 按选中的类型个数生成同样数量的 ?，例如 (?,?,?)。
+            let placeholders = vec!["?"; filter.actions.len()].join(",");
+            sql.push_str(&format!(" AND t.action IN ({})", placeholders));
+            for action in &filter.actions {
+                args.push(Box::new(action.clone()));
+            }
+        }
+
+        if let Some((start, end)) = filter.range {
+            sql.push_str(" AND t.created_at >= ? AND t.created_at <= ?");
+            args.push(Box::new(start));
+            args.push(Box::new(end));
+        }
+
+        sql.push_str(" ORDER BY t.created_at DESC, t.file_path ASC, t.action ASC");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(args.iter().map(|value| value.as_ref())),
+            |row| {
+                Ok(FileOrigin {
+                    file_path: row.get(0)?,
+                    process_name: row.get(1)?,
+                    process_path: row.get(2)?,
+                    created_at: row.get(3)?,
+                    action: row.get(4)?,
+                    note: row.get(5)?,
+                })
+            },
+        )?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// 返回数据库里出现过的所有程序（名称, 完整路径），按名称排序。
+    ///
+    /// 供导出对话框的「创建程序」下拉框使用，让用户直接选，不用手打。
+    pub fn program_choices(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock_connection();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT process_name, process_path FROM (
+                SELECT process_name, process_path FROM file_origins
+                UNION
+                SELECT process_name, process_path FROM file_modifications
+                UNION
+                SELECT process_name, process_path FROM file_deletions
+            )
+            WHERE process_name <> '' AND process_path <> ''
+            ORDER BY process_name COLLATE NOCASE, process_path
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// 按程序汇总五类事件的数量，供「程序统计」窗口使用。    ///
     /// 做法是先把三张表 UNION 成一张统一视图（每行带 `action`），
     /// 再按 `process_path` 分组，用五个 `SUM(CASE WHEN ...)` 分别统计每类次数。
     /// 排序交给界面层处理（用户点哪列就按哪列排）。
@@ -1279,6 +1421,80 @@ mod tests {
                     .starts_with("file_origins.db.corrupt-")
             });
         assert!(has_backup, "损坏的数据库应被改名备份");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 验证导出用的组合筛选能正常工作。
+    #[test]
+    fn query_records_applies_filters() {
+        let dir = std::env::temp_dir().join("file_origin_tracker_db_test_query_filter");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Database::init(&dir).unwrap();
+
+        db.upsert_origin(r"C:\a\alpha.txt", "a.exe", r"C:\a.exe", false)
+            .unwrap();
+        db.upsert_origin(r"C:\a\folder", "b.exe", r"C:\b.exe", true)
+            .unwrap();
+        db.upsert_modification(r"C:\a\alpha.txt", "a.exe", r"C:\a.exe")
+            .unwrap();
+        db.upsert_deletion(r"C:\a\gone.txt", "c.exe", r"C:\c.exe", false)
+            .unwrap();
+        db.set_program_note(r"C:\a.exe", "文档工具").unwrap();
+
+        // 不加任何条件 = 导出全部（4 条：新建文件、新建文件夹、修改、删除）
+        let all = db.query_records(&RecordFilter::default()).unwrap();
+        assert_eq!(all.len(), 4, "无条件时应返回全部记录");
+
+        // 按创建程序筛选：a.exe 有 2 条（新建 + 修改）
+        let by_program = db
+            .query_records(&RecordFilter {
+                program: r"C:\a.exe".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_program.len(), 2);
+
+        // 按关键字筛选：路径里含 alpha 的有 2 条
+        let by_keyword = db
+            .query_records(&RecordFilter {
+                keyword: "alpha".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_keyword.len(), 2);
+
+        // 按监视类型筛选：只要「新建文件」1 条
+        let by_action = db
+            .query_records(&RecordFilter {
+                actions: vec!["create_file".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_action.len(), 1);
+        assert_eq!(by_action[0].action, "create_file");
+
+        // 按备注筛选：a.exe 的备注是「文档工具」，它产生 2 条记录
+        let by_note = db
+            .query_records(&RecordFilter {
+                note: "文档".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_note.len(), 2);
+
+        // 时间范围落在未来时应为空
+        let by_range = db
+            .query_records(&RecordFilter {
+                range: Some((i64::MAX - 10, i64::MAX)),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(by_range.is_empty());
+
+        // 下拉框数据源：三个不同的程序
+        let choices = db.program_choices().unwrap();
+        assert_eq!(choices.len(), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
