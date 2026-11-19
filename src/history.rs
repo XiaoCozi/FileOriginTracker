@@ -1,7 +1,7 @@
 //! “最近记录”窗口。
 //!
 //! 用原生 Win32 ListView 展示数据库中最新的记录
-//! （监控时间 / 程序 / 路径 / 类型）。
+//! （日期 / 时间 / 程序 / 路径 / 类型）。
 //! 使用原生控件而不是网页或 GPU 界面，空闲时几乎不占 CPU：
 //! 只有窗口处于激活状态时，才每 10 秒自动刷新一次列表。
 //!
@@ -96,7 +96,7 @@ static FILTER_END_PICKER: AtomicIsize = AtomicIsize::new(0);
 /// 起、止两端各自是否启用（对应时间框左边的复选框）。
 static FILTER_START_ENABLE: AtomicIsize = AtomicIsize::new(0);
 static FILTER_END_ENABLE: AtomicIsize = AtomicIsize::new(0);
-/// 当前排序列：0=监控时间 1=程序 2=路径 3=类型。
+/// 当前排序列：0=日期 1=时间 2=程序 3=路径 4=类型。
 static SORT_COLUMN: AtomicIsize = AtomicIsize::new(0);
 /// 是否升序。默认 false：时间倒序，最新的记录在最上面。
 static SORT_ASCENDING: AtomicBool = AtomicBool::new(false);
@@ -112,8 +112,9 @@ static CONTEXT_ROW: AtomicIsize = AtomicIsize::new(-1);
 ///
 /// 双击 / 右键时也用它按光标 x 坐标反推用户点的是哪一列，比依赖
 /// `LVM_SUBITEMHITTEST` 返回的 iSubItem 更稳妥。
-const COLUMNS: [(&str, i32); 4] = [
-    ("监控时间", 170),
+const COLUMNS: [(&str, i32); 5] = [
+    ("日期", 100),
+    ("时间", 75),
     ("创建程序", 280),
     ("文件 / 文件夹路径", 440),
     ("类型", 100),
@@ -154,8 +155,13 @@ const DTN_DATETIMECHANGE_CODE: u32 = 0xFFFF_FD09;
 /// DTM_GETSYSTEMTIME 的返回码：0 表示拿到了有效时间。
 const GDT_VALID: isize = 0;
 
-/// 「类型」列的列下标（0 起）。
-const TYPE_COLUMN: i32 = 3;
+/// 各列的列下标（0 起），与 `COLUMNS` 的顺序一一对应。
+const DATE_COLUMN: i32 = 0;
+const TIME_COLUMN: i32 = 1;
+const PROGRAM_COLUMN: i32 = 2;
+const PATH_COLUMN: i32 = 3;
+/// 「类型」列的列下标。
+const TYPE_COLUMN: i32 = 4;
 
 /// 「类型」列每种记录的单元格背景色。
 ///
@@ -863,9 +869,9 @@ fn open_row_target(index: usize, sub_item: i32) {
     };
 
     match sub_item {
-        1 => crate::util::reveal_in_explorer(&row.process_path),
-        2 => open_path_target(&row),
-        // 时间列不做操作。
+        PROGRAM_COLUMN => crate::util::reveal_in_explorer(&row.process_path),
+        PATH_COLUMN => open_path_target(&row),
+        // 日期 / 时间 / 类型列不做操作。
         _ => {}
     }
 }
@@ -1151,14 +1157,17 @@ fn sort_rows(rows: &mut [FileOrigin]) {
     let ascending = SORT_ASCENDING.load(Ordering::SeqCst);
 
     rows.sort_by(|a, b| {
-        let ordering = match column {
-            1 => program_column_text(a)
+        // 0=日期、1=时间，两列都按同一条记录的时间戳排序。
+        let ordering = if column == PROGRAM_COLUMN as isize {
+            program_column_text(a)
                 .to_lowercase()
-                .cmp(&program_column_text(b).to_lowercase()),
-            2 => a.file_path.to_lowercase().cmp(&b.file_path.to_lowercase()),
-            3 => action_label(&a.action).cmp(&action_label(&b.action)),
-            // 0 或其它：按监控时间。
-            _ => a.created_at.cmp(&b.created_at),
+                .cmp(&program_column_text(b).to_lowercase())
+        } else if column == PATH_COLUMN as isize {
+            a.file_path.to_lowercase().cmp(&b.file_path.to_lowercase())
+        } else if column == TYPE_COLUMN as isize {
+            action_label(&a.action).cmp(&action_label(&b.action))
+        } else {
+            a.created_at.cmp(&b.created_at)
         };
         if ascending {
             ordering
@@ -1251,6 +1260,17 @@ unsafe fn handle_custom_draw(lparam: LPARAM) -> LRESULT {
     LRESULT(CDRF_DODEFAULT as isize)
 }
 
+/// 把 `"YYYY-MM-DD HH:MM:SS"` 拆成（日期, 时间）两部分。
+///
+/// 列表和导出都按这个格式显示时间。万一将来格式变了、字符串里没有空格，
+/// 就把整串放进日期列、时间列留空，避免直接崩溃或丢数据。
+fn split_date_time(text: &str) -> (&str, &str) {
+    match text.split_once(' ') {
+        Some((date, time)) => (date, time),
+        None => (text, ""),
+    }
+}
+
 /// 把给定记录填入列表，并同步行缓存（双击 / 右键要靠它按行号找回记录）。
 ///
 /// `keep_scroll` 为 true 时，重建前记住第一条可见的行和选中的行，
@@ -1294,12 +1314,15 @@ fn fill_list(rows: &[FileOrigin], keep_scroll: bool) {
         SendMessageW(list, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
 
         for (index, row) in rows.iter().enumerate() {
-            let time_text = wide(&crate::util::timestamp_to_local_text(row.created_at));
+            // 时间戳先格式化成 "YYYY-MM-DD HH:MM:SS"，再拆成日期和时间两列。
+            let full_time = crate::util::timestamp_to_local_text(row.created_at);
+            let (date_part, time_part) = split_date_time(&full_time);
+            let date_text = wide(date_part);
             let mut item = LVITEMW::default();
             item.mask = LVIF_TEXT;
             item.iItem = index as i32;
-            item.iSubItem = 0;
-            item.pszText = PWSTR(time_text.as_ptr() as *mut u16);
+            item.iSubItem = DATE_COLUMN;
+            item.pszText = PWSTR(date_text.as_ptr() as *mut u16);
 
             // LVM_INSERTITEMW 返回新行真正所在的下标，必须用它来填后续列，
             // 不能假设行一定位于 index，否则列内容会错位或丢失。
@@ -1314,15 +1337,19 @@ fn fill_list(rows: &[FileOrigin], keep_scroll: bool) {
             }
             let row_index = inserted.0 as usize;
 
+            // 时间列（第 1 列）。
+            let time_text = wide(time_part);
+            insert_sub_item(list, row_index, TIME_COLUMN, &time_text);
+
             let program_text = wide(&program_column_text(row));
-            insert_sub_item(list, row_index, 1, &program_text);
+            insert_sub_item(list, row_index, PROGRAM_COLUMN, &program_text);
 
             let path_text = wide(&row.file_path);
-            insert_sub_item(list, row_index, 2, &path_text);
+            insert_sub_item(list, row_index, PATH_COLUMN, &path_text);
 
             // 类型列：让用户直观看到这条记录属于哪类监控。
             let action_text = wide(&action_label(&row.action));
-            insert_sub_item(list, row_index, 3, &action_text);
+            insert_sub_item(list, row_index, TYPE_COLUMN, &action_text);
         }
 
         // 恢复重绘，并主动请求重画一次，避免列表停留在空白状态。
@@ -1708,9 +1735,10 @@ fn write_xlsx(path: &std::path::Path, rows: &[FileOrigin]) -> Result<(), String>
         .set_border(FormatBorder::Thin)
         .set_align(FormatAlign::Center);
 
-    // 列定义：（表头，列宽）。
-    const HEADERS: [(&str, f64); 6] = [
-        ("监控时间", 21.0),
+    // 列定义：（表头，列宽）。日期和时间拆成两列，方便在 Excel 里按日汇总。
+    const HEADERS: [(&str, f64); 7] = [
+        ("日期", 13.0),
+        ("时间", 11.0),
         ("类型", 12.0),
         ("创建程序", 26.0),
         ("备注", 24.0),
@@ -1731,23 +1759,30 @@ fn write_xlsx(path: &std::path::Path, rows: &[FileOrigin]) -> Result<(), String>
     // 数据行：从第 1 行（0 起）开始写，和列表的顺序完全一致。
     for (index, row) in rows.iter().enumerate() {
         let line = index as u32 + 1;
+        // 与列表一致：先把时间戳拆成日期和时间两列。
+        let full_time = crate::util::timestamp_to_local_text(row.created_at);
+        let (date_part, time_part) = split_date_time(&full_time);
+
         sheet
-            .write_string(line, 0, crate::util::timestamp_to_local_text(row.created_at))
+            .write_string(line, 0, date_part)
             .map_err(|error| error.to_string())?;
         sheet
-            .write_string(line, 1, action_label(&row.action))
+            .write_string(line, 1, time_part)
             .map_err(|error| error.to_string())?;
         sheet
-            .write_string(line, 2, &row.process_name)
+            .write_string(line, 2, action_label(&row.action))
             .map_err(|error| error.to_string())?;
         sheet
-            .write_string(line, 3, &row.note)
+            .write_string(line, 3, &row.process_name)
             .map_err(|error| error.to_string())?;
         sheet
-            .write_string(line, 4, &row.file_path)
+            .write_string(line, 4, &row.note)
             .map_err(|error| error.to_string())?;
         sheet
-            .write_string(line, 5, &row.process_path)
+            .write_string(line, 5, &row.file_path)
+            .map_err(|error| error.to_string())?;
+        sheet
+            .write_string(line, 6, &row.process_path)
             .map_err(|error| error.to_string())?;
     }
 
@@ -1819,8 +1854,8 @@ mod tests {
             test_row(r"C:\c\c.txt", "alpha.exe", 1),
         ];
 
-        // 路径升序：a < b < c
-        SORT_COLUMN.store(2, Ordering::SeqCst);
+        // 路径升序：a < b < c（路径现为第 3 列）
+        SORT_COLUMN.store(3, Ordering::SeqCst);
         SORT_ASCENDING.store(true, Ordering::SeqCst);
         sort_rows(&mut rows);
         assert_eq!(rows[0].file_path, r"C:\a\a.txt");
@@ -1831,8 +1866,8 @@ mod tests {
         sort_rows(&mut rows);
         assert_eq!(rows[0].file_path, r"C:\c\c.txt");
 
-        // 程序名升序（忽略大小写：alpha < m < Zeta）
-        SORT_COLUMN.store(1, Ordering::SeqCst);
+        // 程序名升序（忽略大小写：alpha < m < Zeta；程序现为第 2 列）
+        SORT_COLUMN.store(2, Ordering::SeqCst);
         SORT_ASCENDING.store(true, Ordering::SeqCst);
         sort_rows(&mut rows);
         assert_eq!(program_column_text(&rows[0]), "alpha.exe");
@@ -1854,14 +1889,28 @@ mod tests {
     /// 这直接决定双击“创建程序 / 路径”列时能否打开对应目录。
     #[test]
     fn column_at_x_matches_column_widths() {
+        // 列宽依次为：日期 100、时间 75、程序 280、路径 440、类型 100。
         assert_eq!(column_at_x(0), 0);
-        assert_eq!(column_at_x(169), 0);
-        assert_eq!(column_at_x(170), 1);
-        assert_eq!(column_at_x(449), 1);
-        assert_eq!(column_at_x(450), 2);
-        assert_eq!(column_at_x(889), 2);
-        assert_eq!(column_at_x(890), 3);
-        assert_eq!(column_at_x(5000), 3);
+        assert_eq!(column_at_x(99), 0);
+        assert_eq!(column_at_x(100), 1);
+        assert_eq!(column_at_x(174), 1);
+        assert_eq!(column_at_x(175), 2);
+        assert_eq!(column_at_x(454), 2);
+        assert_eq!(column_at_x(455), 3);
+        assert_eq!(column_at_x(894), 3);
+        assert_eq!(column_at_x(895), 4);
+        assert_eq!(column_at_x(5000), 4);
+    }
+
+    /// 验证时间字符串能正确拆成日期和时间。
+    #[test]
+    fn split_date_time_splits_on_space() {
+        assert_eq!(
+            super::split_date_time("2026-11-19 08:30:05"),
+            ("2026-11-19", "08:30:05")
+        );
+        // 没有空格时整串进日期列，时间列留空，不丢内容。
+        assert_eq!(super::split_date_time("2026-11-19"), ("2026-11-19", ""));
     }
 
     /// 验证导出的确生成了一个合法的 .xlsx 文件。
