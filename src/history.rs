@@ -135,6 +135,8 @@ const FILTER_START_ENABLE_ID: usize = 6;
 const FILTER_END_ENABLE_ID: usize = 7;
 /// 顶部工具栏右侧的「程序统计」按钮。
 const STATS_BUTTON_ID: usize = 8;
+/// 顶部工具栏最右侧的「导出 Excel」按钮。
+const EXPORT_BUTTON_ID: usize = 9;
 
 /// 右键菜单命令 ID。
 ///
@@ -234,7 +236,7 @@ pub fn show() -> Result<()> {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            1000,
+            1100,
             560,
             HWND::default(),
             HMENU::default(),
@@ -310,6 +312,10 @@ unsafe extern "system" fn window_procedure(
                     if let Err(error) = crate::stats::show() {
                         log::error!("打开程序统计窗口失败：{:#}", error);
                     }
+                }
+                // 「导出 Excel」按钮：把当前筛选后的列表导出成 .xlsx。
+                _ if id == EXPORT_BUTTON_ID as u32 => {
+                    export_to_excel(hwnd);
                 }
                 // 搜索框内容变化：立刻按关键字重新过滤列表。
                 _ if id == SEARCH_CONTROL_ID as u32 && code == EN_CHANGE_CODE => {
@@ -676,6 +682,26 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         None,
     ) {
         SendMessageW(clear_button, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+
+    // 「导出 Excel」：把当前列表里的记录（受搜索框和时间筛选影响）导出成 .xlsx。
+    // 位置放在工具栏最右侧，需要窗口宽度足够，所以默认窗口宽度设为 1100。
+    let export_text = wide("导出 Excel");
+    if let Ok(export_button) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(button_class.as_ptr()),
+        PCWSTR(export_text.as_ptr()),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+        970,
+        8,
+        90,
+        24,
+        window,
+        HMENU(EXPORT_BUTTON_ID as *mut c_void),
+        instance,
+        None,
+    ) {
+        SendMessageW(export_button, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
     }
 
     let list_class = wide("SysListView32");
@@ -1516,6 +1542,196 @@ fn action_label(action: &str) -> String {
     }
 }
 
+/// 把当前列表里的记录导出成 Excel（.xlsx）表格。
+///
+/// 「筛选导出」的含义：导出内容就是**屏幕上看到的这批记录**——
+/// 已经按搜索框关键字和时间范围过滤、也保持了当前列排序。
+/// 所以想把全部记录导出去，先点「清除筛选」，再点导出即可。
+/// 实现上直接读内存里的 `ROW_CACHE`，不会再查一次数据库，开销只有写文件本身。
+unsafe fn export_to_excel(window: HWND) {
+    // 取一份当前列表的副本，避免写文件期间列表被定时刷新改动。
+    let rows: Vec<FileOrigin> = match ROW_CACHE.lock() {
+        Ok(cache) => cache.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+
+    if rows.is_empty() {
+        let text = wide("当前没有可导出的记录。");
+        let title = wide("导出 Excel");
+        let _ = MessageBoxW(
+            window,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    }
+
+    // 让用户选择保存位置；用户点「取消」时返回 None，直接结束。
+    let Some(path) = ask_save_path(window) else {
+        return;
+    };
+
+    match write_xlsx(&path, &rows) {
+        Ok(()) => {
+            let text = wide(&format!(
+                "已导出 {} 条记录到：\n{}",
+                rows.len(),
+                path.display()
+            ));
+            let title = wide("导出成功");
+            let _ = MessageBoxW(
+                window,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONINFORMATION,
+            );
+            log::info!("已导出 {} 条记录到 {}", rows.len(), path.display());
+        }
+        Err(error) => {
+            let text = wide(&format!("导出失败：\n{}", error));
+            let title = wide("导出失败");
+            let _ = MessageBoxW(
+                window,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING,
+            );
+            log::error!("导出 Excel 失败：{}", error);
+        }
+    }
+}
+
+/// 弹出系统的「另存为」对话框，返回用户选择的保存路径。
+///
+/// 默认文件名为 `file_origin_export_<Unix 时间戳>.xlsx`，
+/// 这样连续导出多次也不会互相覆盖。
+fn ask_save_path(window: HWND) -> Option<std::path::PathBuf> {
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetSaveFileNameW, OFN_HIDEREADONLY, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let default_name = format!("file_origin_export_{stamp}.xlsx");
+
+    // lpstrFile 是输入输出缓冲区：进入时是默认文件名，返回时是完整路径。
+    let mut buffer = vec![0u16; 1024];
+    for (index, unit) in default_name.encode_utf16().enumerate() {
+        if index + 1 < buffer.len() {
+            buffer[index] = unit;
+        }
+    }
+
+    // 过滤器格式：显示名\0通配符\0显示名\0通配符\0\0（整体以两个 0 结束）。
+    let filter: Vec<u16> = "Excel 工作簿 (*.xlsx)\0*.xlsx\0所有文件 (*.*)\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let title = wide("导出为 Excel 表格");
+    // 用户不写扩展名时，系统自动补 .xlsx。
+    let default_ext: Vec<u16> = "xlsx\0".encode_utf16().collect();
+
+    let mut dialog = OPENFILENAMEW::default();
+    dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = window;
+    dialog.lpstrFilter = PCWSTR(filter.as_ptr());
+    dialog.lpstrFile = PWSTR(buffer.as_mut_ptr());
+    dialog.nMaxFile = buffer.len() as u32;
+    dialog.lpstrTitle = PCWSTR(title.as_ptr());
+    dialog.lpstrDefExt = PCWSTR(default_ext.as_ptr());
+    // 覆盖已有文件时提示确认；目录必须存在。
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+
+    if !unsafe { GetSaveFileNameW(&mut dialog) }.as_bool() {
+        return None;
+    }
+
+    let end = buffer.iter().position(|&unit| unit == 0).unwrap_or(0);
+    let path = String::from_utf16_lossy(&buffer[..end]);
+    if path.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(path))
+    }
+}
+
+/// 把记录写进一个真正的 `.xlsx` 工作簿。
+///
+/// 使用 `rust_xlsxwriter`（纯 Rust，无外部运行库依赖），
+/// 生成的是标准 Excel 文件，可以直接用 Excel / WPS / LibreOffice 打开。
+fn write_xlsx(path: &std::path::Path, rows: &[FileOrigin]) -> Result<(), String> {
+    use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook};
+
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_worksheet();
+    sheet
+        .set_name("文件来源记录")
+        .map_err(|error| error.to_string())?;
+
+    // 表头样式：加粗、浅蓝底色、细边框、居中。
+    let header = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0xE8_EE_F7))
+        .set_border(FormatBorder::Thin)
+        .set_align(FormatAlign::Center);
+
+    // 列定义：（表头，列宽）。
+    const HEADERS: [(&str, f64); 6] = [
+        ("监控时间", 21.0),
+        ("类型", 12.0),
+        ("创建程序", 26.0),
+        ("备注", 24.0),
+        ("文件 / 文件夹路径", 70.0),
+        ("创建程序路径", 55.0),
+    ];
+
+    for (column, (title, width)) in HEADERS.iter().enumerate() {
+        let column = column as u16;
+        sheet
+            .set_column_width(column, *width)
+            .map_err(|error| error.to_string())?;
+        sheet
+            .write_string_with_format(0, column, *title, &header)
+            .map_err(|error| error.to_string())?;
+    }
+
+    // 数据行：从第 1 行（0 起）开始写，和列表的顺序完全一致。
+    for (index, row) in rows.iter().enumerate() {
+        let line = index as u32 + 1;
+        sheet
+            .write_string(line, 0, crate::util::timestamp_to_local_text(row.created_at))
+            .map_err(|error| error.to_string())?;
+        sheet
+            .write_string(line, 1, action_label(&row.action))
+            .map_err(|error| error.to_string())?;
+        sheet
+            .write_string(line, 2, &row.process_name)
+            .map_err(|error| error.to_string())?;
+        sheet
+            .write_string(line, 3, &row.note)
+            .map_err(|error| error.to_string())?;
+        sheet
+            .write_string(line, 4, &row.file_path)
+            .map_err(|error| error.to_string())?;
+        sheet
+            .write_string(line, 5, &row.process_path)
+            .map_err(|error| error.to_string())?;
+    }
+
+    // 冻结首行，滚动时表头始终可见。
+    sheet
+        .set_freeze_panes(1, 0)
+        .map_err(|error| error.to_string())?;
+    // 给表头加上自动筛选下拉箭头，方便在 Excel 里二次筛选。
+    sheet
+        .autofilter(0, 0, rows.len() as u32, HEADERS.len() as u16 - 1)
+        .map_err(|error| error.to_string())?;
+
+    workbook.save(path).map_err(|error| error.to_string())
+}
+
 /// 给某一行填充子列文本。
 unsafe fn insert_sub_item(list: HWND, row: usize, column: i32, text: &[u16]) {
     let mut item = LVITEMW::default();
@@ -1615,5 +1831,32 @@ mod tests {
         assert_eq!(column_at_x(889), 2);
         assert_eq!(column_at_x(890), 3);
         assert_eq!(column_at_x(5000), 3);
+    }
+
+    /// 验证导出的确生成了一个合法的 .xlsx 文件。
+    ///
+    /// .xlsx 本质是 zip 压缩包，所以只要文件头是 `PK`、
+    /// 并且压缩包里出现了标准文件名 `xl/workbook.xml`，就说明结构正确。
+    #[test]
+    fn export_writes_valid_xlsx() {
+        let dir = std::env::temp_dir().join("file_origin_tracker_xlsx_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.xlsx");
+
+        let mut row = test_row(r"C:\probe\a.txt", "notepad.exe", 1_700_000_000);
+        row.note = "测试备注".to_string();
+        row.action = "create_dir".to_string();
+
+        super::write_xlsx(&path, &[row]).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..2], b"PK", "xlsx 应以 zip 头 PK 开头");
+        assert!(
+            bytes.windows(15).any(|window| window == b"xl/workbook.xml"),
+            "压缩包里应包含 xl/workbook.xml"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
