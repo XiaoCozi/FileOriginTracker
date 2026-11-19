@@ -13,6 +13,12 @@
 #   dist\FileOriginTracker-v<版本号>.zip              双文件版发行包
 #   dist\FileOriginTracker-single.exe                 单文件版（直接分发，不打压缩包）
 
+param(
+    # 跳过编译，直接使用 target\release 里已有的产物。
+    # GitHub Actions 会先单独执行 cargo build，再带这个开关调用本脚本。
+    [switch]$SkipBuild
+)
+
 $ErrorActionPreference = 'Stop'
 
 $project = Split-Path -Parent $PSScriptRoot
@@ -21,13 +27,17 @@ $exe = Join-Path $target 'file-origin-tracker.exe'
 $dll = Join-Path $target 'file_origin_tracker_shell.dll'
 
 # 1. 编译（优先用 PATH 里的 cargo，其次用默认安装位置）
-$cargo = (Get-Command cargo -ErrorAction SilentlyContinue).Source
-if (-not $cargo) {
-    $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
+if ($SkipBuild) {
+    Write-Host '已指定 -SkipBuild，跳过编译，直接使用现有产物。'
+} else {
+    $cargo = (Get-Command cargo -ErrorAction SilentlyContinue).Source
+    if (-not $cargo) {
+        $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
+    }
+    Write-Host "正在编译：$cargo"
+    & $cargo build --release --offline --manifest-path (Join-Path $project 'Cargo.toml')
+    if ($LASTEXITCODE -ne 0) { throw '编译失败，未生成单文件 exe' }
 }
-Write-Host "正在编译：$cargo"
-& $cargo build --release --offline --manifest-path (Join-Path $project 'Cargo.toml')
-if ($LASTEXITCODE -ne 0) { throw '编译失败，未生成单文件 exe' }
 
 foreach ($file in @($exe, $dll)) {
     if (-not (Test-Path $file)) { throw "缺少产物：$file" }
