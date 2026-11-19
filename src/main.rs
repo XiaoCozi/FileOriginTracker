@@ -161,6 +161,81 @@ fn is_elevated() -> bool {
 /// 加上 `SEE_MASK_NO_CONSOLE` 标志，避免提权后的新进程继承/弹出控制台窗口。
 /// 主程序本身已经用 `#![windows_subsystem = "windows"]` 编译为 GUI 子系统，
 /// 不会自带控制台；这里的标志是防止 ShellExecute 在某些情况下额外开一个 cmd 窗口。
+/// 单实例互斥体的名称。
+///
+/// `Local\` 前缀表示“只在当前登录会话内唯一”：
+/// 同一用户重复启动会被拦住；不同用户各自登录后可以各跑一份，互不干扰。
+const SINGLE_INSTANCE_MUTEX: &str = "Local\\FileOriginTracker.SingleInstance";
+
+/// 尝试成为唯一实例。
+///
+/// 返回值说明：
+/// - `Some(句柄)`：抢到了互斥体，是唯一实例。句柄必须一直持有到进程结束，
+///   否则互斥体被释放，后面再启动的进程就检测不到“已有实例”了。
+/// - `None`：已经有实例在运行。本函数会顺手把已有窗口唤到前台，调用方直接退出即可。
+fn acquire_single_instance() -> Option<windows::Win32::Foundation::HANDLE> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    unsafe {
+        let name = HSTRING::from(SINGLE_INSTANCE_MUTEX);
+        let handle = CreateMutexW(None, false, &name).ok()?;
+
+        // CreateMutexW 即使互斥体已存在也会返回句柄，只是错误码会变成
+        // ERROR_ALREADY_EXISTS。所以不能只看返回值，必须再查一次错误码。
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            focus_existing_instance();
+            let _ = CloseHandle(handle);
+            return None;
+        }
+
+        Some(handle)
+    }
+}
+
+/// 把已经在运行的实例的「最近记录」窗口还原并置前，让用户知道程序就在托盘里。
+fn focus_existing_instance() {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+
+    unsafe {
+        let title = HSTRING::from("文件来源追踪 - 最近记录");
+        if let Ok(window) = FindWindowW(PCWSTR::null(), &title) {
+            if !window.is_invalid() {
+                let _ = ShowWindow(window, SW_RESTORE);
+                let _ = SetForegroundWindow(window);
+            }
+        }
+    }
+}
+
+/// 监控启动失败时弹窗提示。
+///
+/// 如果不提示，用户只会看到托盘图标，误以为程序正在正常记录，
+/// 实际上一条记录都不会产生，所以这里必须主动告知原因与日志位置。
+fn show_monitor_start_failure(detail: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MessageBoxW};
+
+    let text = HSTRING::from(format!(
+        "文件监控启动失败，程序不会记录任何文件操作。\n\n\
+         常见原因：\n\
+         1. 未以管理员身份运行；\n\
+         2. 被安全软件拦截。\n\n\
+         详细信息：{detail}\n\n\
+         日志位置：数据目录下的 file_origin_tracker.log"
+    ));
+    let title = HSTRING::from("文件来源追踪 - 监控启动失败");
+
+    unsafe {
+        let _ = MessageBoxW(HWND::default(), &text, &title, MB_OK | MB_ICONWARNING);
+    }
+}
+
 fn restart_as_admin() {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::HWND;
@@ -242,6 +317,16 @@ fn main() -> Result<()> {
     }
     info!("已获得管理员权限，ETW 追踪可用");
 
+    // 3.5 单实例保护：同一登录会话只允许运行一个主程序。
+    //     必须放在提权检查之后：非管理员进程会先请求提权然后退出，
+    //     如果把互斥体放在提权之前创建，提权后的新进程会被自己拦住。
+    //     也不能放在前面 `history` / `shell-menu` 分支之前，
+    //     否则双击快捷方式打开记录窗口时会被正在运行的实例挡掉。
+    let Some(_single_instance) = acquire_single_instance() else {
+        info!("检测到已有实例在运行，本次启动退出");
+        return Ok(());
+    };
+
     // 4. 加载配置
     let cfg = config::Config::load_or_default()?;
     info!("数据存储目录: {}", cfg.data_dir.display());
@@ -305,6 +390,9 @@ fn main() -> Result<()> {
             Err(error) => {
                 error!("ETW 文件追踪启动失败: {:#}", error);
                 error!("提示：请右键以管理员身份运行本程序，才能记录文件创建来源。");
+                // 仅仅写日志不够：GUI 程序没有控制台，用户看不到这行日志，
+                // 会误以为程序在正常记录，所以这里弹窗明确告知。
+                show_monitor_start_failure(&error.to_string());
             }
         }
     } else {

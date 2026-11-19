@@ -8,8 +8,9 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 数据库包装器（线程安全，内部用 Mutex 保护连接）
 #[derive(Clone)]
@@ -85,12 +86,83 @@ impl ProgramStat {
     }
 }
 
+/// 用 `PRAGMA quick_check` 快速判断数据库能否正常读取。
+///
+/// 返回 `false` 只表示“文件确实坏了”，**不会**把“被其它进程占用”误判为损坏：
+/// 遇到锁等待超时之类的错误一律当作健康，避免误伤正常数据库。
+///
+/// `quick_check` 比 `integrity_check` 快得多（跳过索引与内容逐项校验），
+/// 每次启动执行一次，开销可以忽略。
+fn database_is_healthy(path: &Path) -> bool {
+    let conn = match Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        // 连打开都失败时，只有“不是数据库 / 已损坏”才算坏；
+        // 其余（如被占用、权限不足）先假定健康，交给后面的正常流程报错。
+        Err(error) => return !is_corruption_error(&error),
+    };
+
+    // 等待最多 3 秒，尽量排除“刚好在被别的进程写入”这种情况。
+    let _ = conn.busy_timeout(Duration::from_secs(3));
+
+    match conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0)) {
+        Ok(result) => result.eq_ignore_ascii_case("ok"),
+        Err(error) => !is_corruption_error(&error),
+    }
+}
+
+/// 判断 SQLite 错误是否属于“文件损坏”这一类。
+fn is_corruption_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::DatabaseCorrupt
+                || inner.code == rusqlite::ErrorCode::NotADatabase
+    )
+}
+
+/// 把损坏的数据库文件改名为 `file_origins.db.corrupt-<时间戳>` 保留下来。
+///
+/// 只改名不删除，用户需要时还能从备份里抢救数据；
+/// 同时把 WAL / SHM 两个附属文件一起挪走，否则新建的空库会读到旧的未提交数据。
+fn quarantine_database(db_path: &Path) {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let backup = db_path.with_file_name(format!("file_origins.db.corrupt-{stamp}"));
+    let _ = std::fs::rename(db_path, &backup);
+
+    for suffix in ["-wal", "-shm"] {
+        let side = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+        if side.exists() {
+            let side_backup = PathBuf::from(format!("{}.corrupt-{stamp}", side.display()));
+            let _ = std::fs::rename(&side, &side_backup);
+        }
+    }
+
+    log::error!(
+        "检测到数据库损坏，已备份为 {} 并重建空库",
+        backup.display()
+    );
+}
+
 impl Database {
     /// 初始化数据库（创建连接 + 建表）
     pub fn init(data_dir: &Path) -> Result<Self> {
         // 确保数据目录存在
         std::fs::create_dir_all(data_dir)?;
         let db_path = data_dir.join("file_origins.db");
+
+        // 启动自检：数据库文件已经存在时，先判断它是否完好。
+        // 如果检测到文件损坏（例如异常断电导致 WAL 写坏），把整个库改名备份、
+        // 再重建一个空库，避免程序因为打不开数据库而直接起不来。
+        if db_path.exists() && !database_is_healthy(&db_path) {
+            quarantine_database(&db_path);
+        }
 
         // 打开 SQLite 连接
         let conn = Connection::open(&db_path)
@@ -1174,6 +1246,39 @@ mod tests {
         let rows = db.recent(10).unwrap();
         assert_eq!(rows[0].note, "");
         assert_eq!(db.program_note(r"C:\Windows\notepad.exe").unwrap(), "");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 验证数据库损坏时能自动备份并重建空库，而不是让程序启动失败。
+    #[test]
+    fn corrupt_database_is_quarantined_and_recreated() {
+        let dir = std::env::temp_dir().join("file_origin_tracker_db_test_corrupt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 写一个根本不是 SQLite 格式的“数据库”文件。
+        let db_path = dir.join("file_origins.db");
+        std::fs::write(&db_path, b"this is definitely not a sqlite database")
+            .unwrap();
+
+        // 初始化应当成功（内部会把坏文件改名备份，再建新库）。
+        let db = Database::init(&dir).unwrap();
+        db.upsert_origin(r"C:\ok.txt", "a.exe", r"C:\a.exe", false)
+            .unwrap();
+        assert_eq!(db.recent(10).unwrap().len(), 1);
+
+        // 坏文件必须被保留下来（改名成 .corrupt-<时间戳>），不能直接删掉。
+        let has_backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("file_origins.db.corrupt-")
+            });
+        assert!(has_backup, "损坏的数据库应被改名备份");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
