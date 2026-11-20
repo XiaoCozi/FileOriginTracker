@@ -273,6 +273,69 @@ fn actions_matching_keyword(keyword: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// 创建或补全当前版本所需的表结构。
+///
+/// 正常启动和“生成空数据库”共用这一段，避免迁移出来的新库缺少名单、
+/// 备注等数据表。旧数据库缺少的表也会在这里补齐，已有记录不会改变。
+fn create_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS file_origins (
+            file_path     TEXT PRIMARY KEY,
+            process_name  TEXT NOT NULL,
+            process_path  TEXT NOT NULL,
+            created_at    INTEGER NOT NULL,
+            is_directory  INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS file_modifications (
+            file_path     TEXT PRIMARY KEY,
+            process_name  TEXT NOT NULL,
+            process_path  TEXT NOT NULL,
+            modified_at   INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS file_deletions (
+            file_path     TEXT PRIMARY KEY,
+            process_name  TEXT NOT NULL,
+            process_path  TEXT NOT NULL,
+            deleted_at    INTEGER NOT NULL,
+            is_directory  INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_process_name
+            ON file_origins(process_name);
+        CREATE INDEX IF NOT EXISTS idx_created_at
+            ON file_origins(created_at);
+        CREATE INDEX IF NOT EXISTS idx_modified_at
+            ON file_modifications(modified_at);
+        CREATE INDEX IF NOT EXISTS idx_deleted_at
+            ON file_deletions(deleted_at);
+
+        CREATE TABLE IF NOT EXISTS program_notes (
+            process_path TEXT PRIMARY KEY,
+            note         TEXT NOT NULL,
+            updated_at   INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS list_entries (
+            mode     TEXT NOT NULL,
+            path     TEXT NOT NULL,
+            kind     TEXT NOT NULL,
+            added_at INTEGER NOT NULL,
+            PRIMARY KEY (mode, path)
+        );
+        "#,
+    )?;
+
+    // 旧版本没有这一列；重复添加所产生的错误可以安全忽略。
+    let _ = conn.execute(
+        "ALTER TABLE file_origins ADD COLUMN is_directory INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    Ok(())
+}
+
 impl Database {
     /// 初始化数据库（创建连接 + 建表）
     pub fn init(data_dir: &Path) -> Result<Self> {
@@ -299,80 +362,71 @@ impl Database {
         // 避免偶发的同时写入直接报 “database is locked”。
         conn.execute_batch("PRAGMA busy_timeout=3000;")?;
 
-        // 创建表结构
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS file_origins (
-                file_path     TEXT PRIMARY KEY,       -- 文件路径作为主键（唯一）
-                process_name  TEXT NOT NULL,           -- 进程名
-                process_path  TEXT NOT NULL,           -- 进程完整路径
-                created_at    INTEGER NOT NULL,        -- 创建时间戳
-                is_directory  INTEGER NOT NULL DEFAULT 0  -- 1 表示这是文件夹
-            );
-
-            -- 文件修改记录：每个路径只保留最后一次修改，避免无限膨胀
-            CREATE TABLE IF NOT EXISTS file_modifications (
-                file_path     TEXT PRIMARY KEY,
-                process_name  TEXT NOT NULL,
-                process_path  TEXT NOT NULL,
-                modified_at   INTEGER NOT NULL
-            );
-
-            -- 删除记录：和新建记录分开存。
-            -- 如果复用 file_origins，删除事件会把“谁创建的”这条记录覆盖掉，
-            -- 所以单独建表，让创建和删除两条信息都能保留。
-            CREATE TABLE IF NOT EXISTS file_deletions (
-                file_path     TEXT PRIMARY KEY,
-                process_name  TEXT NOT NULL,
-                process_path  TEXT NOT NULL,
-                deleted_at    INTEGER NOT NULL,
-                is_directory  INTEGER NOT NULL DEFAULT 0
-            );
-
-            -- 为进程名建索引，方便按程序查询
-            CREATE INDEX IF NOT EXISTS idx_process_name 
-                ON file_origins(process_name);
-
-            -- 为创建时间建索引，方便排序和清理
-            CREATE INDEX IF NOT EXISTS idx_created_at 
-                ON file_origins(created_at);
-
-            CREATE INDEX IF NOT EXISTS idx_modified_at
-                ON file_modifications(modified_at);
-
-            CREATE INDEX IF NOT EXISTS idx_deleted_at
-                ON file_deletions(deleted_at);
-
-            -- 程序备注：给某个程序（按完整路径区分）加一句说明，
-            -- 之后该程序的所有监控记录都会显示这句备注。
-            CREATE TABLE IF NOT EXISTS program_notes (
-                process_path TEXT PRIMARY KEY,
-                note         TEXT NOT NULL,
-                updated_at   INTEGER NOT NULL
-            );
-
-            -- 黑白名单：mode 区分黑名单(black)和白名单(white)，
-            -- kind 区分程序(program)和文件夹(folder)，同一条目只存一份。
-            CREATE TABLE IF NOT EXISTS list_entries (
-                mode     TEXT NOT NULL,
-                path     TEXT NOT NULL,
-                kind     TEXT NOT NULL,
-                added_at INTEGER NOT NULL,
-                PRIMARY KEY (mode, path)
-            );
-            "#,
-        )?;
-
-        // 旧版本数据库没有 is_directory 列，这里补上。
-        // 列已存在时 SQLite 会报错，直接忽略即可。
-        let _ = conn.execute(
-            "ALTER TABLE file_origins ADD COLUMN is_directory INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
+        create_schema(&conn)?;
 
         Ok(Database {
             conn: std::sync::Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// 把数据库以一致快照导出到指定的新文件。
+    ///
+    /// `VACUUM INTO` 会读取 WAL 中已经提交、但尚未合并进主 db 文件的记录，
+    /// 因此比直接复制 `file_origins.db` 更适合迁移。目标文件必须不存在。
+    pub fn export_consistent_snapshot(source: &Path, destination: &Path) -> Result<()> {
+        if !source.exists() {
+            return Err(anyhow::anyhow!("原数据库不存在：{}", source.display()));
+        }
+        if destination.exists() {
+            return Err(anyhow::anyhow!("目标数据库已存在：{}", destination.display()));
+        }
+
+        let conn = Connection::open(source)
+            .with_context(|| format!("无法打开原数据库：{}", source.display()))?;
+        conn.busy_timeout(Duration::from_secs(3))?;
+        // 老版本数据库可能还没有备注或名单表，导出前按当前版本补齐结构。
+        create_schema(&conn)?;
+        conn.execute(
+            "VACUUM INTO ?1",
+            params![destination.to_string_lossy().as_ref()],
+        )
+        .with_context(|| format!("无法导出数据库到：{}", destination.display()))?;
+        conn.close().map_err(|(_, error)| error)?;
+        Self::verify_file(destination)
+    }
+
+    /// 在指定路径创建一个带完整表结构的空数据库，供“保留设置，重新记录”使用。
+    pub fn create_empty_file(destination: &Path) -> Result<()> {
+        if destination.exists() {
+            return Err(anyhow::anyhow!("目标数据库已存在：{}", destination.display()));
+        }
+        let conn = Connection::open(destination)
+            .with_context(|| format!("无法创建空数据库：{}", destination.display()))?;
+        create_schema(&conn)?;
+        conn.close().map_err(|(_, error)| error)?;
+        Self::verify_file(destination)
+    }
+
+    /// 校验数据库可读、完整，并包含程序必需的五张表。
+    pub fn verify_file(path: &Path) -> Result<()> {
+        if !database_is_healthy(path) {
+            return Err(anyhow::anyhow!("数据库完整性校验失败：{}", path.display()));
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let table_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name IN \
+             ('file_origins', 'file_modifications', 'file_deletions', 'program_notes', 'list_entries')",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_count != 5 {
+            return Err(anyhow::anyhow!("数据库缺少必要数据表：{}", path.display()));
+        }
+        Ok(())
     }
 
     /// 以只读方式打开已有数据库（供右键菜单扩展和记录窗口使用）。

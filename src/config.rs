@@ -1,11 +1,11 @@
 //! 配置管理模块。
 //!
-//! 配置文件固定保存在“基准目录”中：
+//! 配置的默认位置仍由本模块确定：
 //! - 如果设置了环境变量 `FILE_ORIGIN_TRACKER_DATA_DIR`，使用该目录；
 //! - 否则使用当前用户的 `AppData\Local\FileOriginTracker\FileOriginTracker`。
 //!
-//! `config.json` 里的 `data_dir` 字段决定**数据库**保存位置。
-//! 修改该字段后重启程序，记录就会保存到指定文件夹。
+//! 自定义配置 / 数据库目录由 `storage` 模块记录。这里保留原来的读取接口，
+//! 所以记录窗口、右键菜单等调用方不需要关心配置实际被移到了哪里。
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -68,8 +68,8 @@ fn default_true() -> bool {
 }
 
 impl Config {
-    /// 配置文件所在的基准目录。
-    fn base_dir() -> Result<PathBuf> {
+    /// 默认基准目录，同时也是路径指引文件保存的位置。
+    pub(crate) fn base_dir() -> Result<PathBuf> {
         if let Some(directory) = std::env::var_os("FILE_ORIGIN_TRACKER_DATA_DIR") {
             return Ok(PathBuf::from(directory));
         }
@@ -79,25 +79,18 @@ impl Config {
         Ok(dirs.data_local_dir().to_path_buf())
     }
 
-    fn config_path() -> Result<PathBuf> {
-        Ok(Self::base_dir()?.join("config.json"))
+    /// 从指定文件读取配置，不处理路径定位，也不自动创建文件。
+    pub(crate) fn read_from(config_path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(config_path)
+            .with_context(|| format!("无法读取配置文件: {}", config_path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("配置文件格式错误: {}", config_path.display()))
     }
 
-    /// 加载配置；首次运行时创建默认配置。
-    pub fn load_or_default() -> Result<Self> {
-        let config_path = Self::config_path()?;
-
-        if config_path.exists() {
-            let content = fs::read_to_string(&config_path)
-                .with_context(|| format!("无法读取配置文件: {}", config_path.display()))?;
-            let config: Config = serde_json::from_str(&content)
-                .with_context(|| format!("配置文件格式错误: {}", config_path.display()))?;
-            return Ok(config);
-        }
-
-        let base = Self::base_dir()?;
-        let config = Config {
-            data_dir: base,
+    /// 生成一份默认配置。只有首次运行时才使用，路径切换会保留现有设置。
+    pub(crate) fn default_with_data_dir(data_dir: PathBuf) -> Self {
+        Config {
+            data_dir,
             auto_register_context_menu: true,
             ignore_temp_dirs: true,
             ignore_system_dirs: true,
@@ -109,9 +102,12 @@ impl Config {
             monitor_delete_file: true,
             monitor_delete_dir: true,
             list_mode: default_list_mode(),
-        };
-        config.save()?;
-        Ok(config)
+        }
+    }
+
+    /// 加载当前配置；首次运行时创建默认配置。
+    pub fn load_or_default() -> Result<Self> {
+        crate::storage::load_active_config()
     }
 
     /// 所有监控开关中是否至少有一个开启。
@@ -140,33 +136,15 @@ impl Config {
 
     /// 返回数据库实际使用的目录。
     ///
-    /// 托盘窗口、右键菜单扩展等模块无法访问主程序的 `Config` 对象，
-    /// 因此统一从这里读取 `config.json`，保证各处使用同一个目录。
+    /// 托盘窗口、右键菜单扩展等模块继续调用这个接口；路径指引会让它们
+    /// 自动找到迁移后的数据库，待重启的切换任务则不会影响当前读取位置。
     pub fn default_data_dir() -> Result<PathBuf> {
-        let base = Self::base_dir()?;
-        let config_path = base.join("config.json");
-
-        if let Ok(content) = fs::read_to_string(&config_path) {
-            if let Ok(config) = serde_json::from_str::<Config>(&content) {
-                return Ok(config.data_dir);
-            }
-        }
-
-        Ok(base)
+        crate::storage::active_data_dir()
     }
 
-    /// 保存配置到基准目录（配置位置始终固定，避免移动数据库后找不到配置）。
+    /// 保存到当前生效的配置位置，而不是待切换的目标位置。
     pub fn save(&self) -> Result<()> {
-        let config_path = Self::config_path()?;
-        if let Some(directory) = config_path.parent() {
-            fs::create_dir_all(directory)
-                .with_context(|| format!("无法创建配置目录: {}", directory.display()))?;
-        }
-
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(&config_path, json)
-            .with_context(|| format!("无法写入配置文件: {}", config_path.display()))?;
-        Ok(())
+        crate::storage::save_active_config(self)
     }
 
     /// 判断是否应该忽略这个路径（临时目录或系统目录）。

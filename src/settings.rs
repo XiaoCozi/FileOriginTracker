@@ -11,31 +11,39 @@
 //! 不使用对话框资源文件，避免额外引入 .rc 编译步骤。
 
 use anyhow::Result;
+use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor};
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
+use windows::Win32::UI::Shell::{
+    SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
+    BROWSEINFOW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetWindowTextW, LoadCursorW, MessageBoxW, RegisterClassExW,
-    SendMessageW, SetWindowTextW, ShowWindow, BS_AUTOCHECKBOX,
-    BS_AUTORADIOBUTTON, BS_OWNERDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_NUMBER,
-    HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW, MB_ICONWARNING, MB_OK, SW_HIDE, SW_SHOWNORMAL,
-    WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_PAINT, WM_SETICON,
-    WNDCLASSEXW, WS_CHILD,
-    WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, GetWindowTextLengthW, GetWindowTextW, LoadCursorW,
+    MessageBoxW, RegisterClassExW, SendMessageW, SetWindowTextW, ShowWindow, BS_AUTOCHECKBOX,
+    BS_AUTORADIOBUTTON, BS_OWNERDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_MULTILINE, ES_NUMBER,
+    ES_READONLY, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW, MB_ICONWARNING, MB_OK, SW_HIDE,
+    SW_SHOWNORMAL, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_PAINT,
+    WM_SETICON, WNDCLASSEXW, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::Config;
 use crate::db::Database;
+use crate::storage::{self, StorageLocation, SwitchMode};
 use crate::util::wide;
 
 const WINDOW_TITLE: &str = "文件来源追踪 - 设置";
@@ -72,6 +80,25 @@ const ID_WHITELIST_RADIO: usize = 2011;
 const ID_MANAGE_LIST_BUTTON: usize = 2012;
 /// 打开「关于」对话框。
 const ID_ABOUT_BUTTON: usize = 2015;
+/// 存储位置：共用 / 独立目录。
+const ID_SHARED_PATH_RADIO: usize = 2016;
+const ID_SEPARATE_PATH_RADIO: usize = 2017;
+const ID_SHARED_PATH_EDIT: usize = 2018;
+const ID_CONFIG_PATH_EDIT: usize = 2019;
+const ID_DATA_PATH_EDIT: usize = 2020;
+const ID_BROWSE_SHARED_BUTTON: usize = 2021;
+const ID_BROWSE_CONFIG_BUTTON: usize = 2022;
+const ID_BROWSE_DATA_BUTTON: usize = 2023;
+const ID_PROGRAM_PATH_BUTTON: usize = 2024;
+const ID_APPDATA_PATH_BUTTON: usize = 2025;
+const ID_MIGRATE_RADIO: usize = 2026;
+const ID_FRESH_RADIO: usize = 2027;
+const ID_CANCEL_SWITCH_BUTTON: usize = 2028;
+const ID_SHARED_PATH_LABEL: usize = 2029;
+const ID_CONFIG_PATH_LABEL: usize = 2030;
+const ID_DATA_PATH_LABEL: usize = 2031;
+const ID_SWITCH_STATUS_LABEL: usize = 2032;
+const ID_PREVIOUS_PATH_EDIT: usize = 2033;
 
 /// 开机自启使用的注册表位置：当前用户登录时自动运行。
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -82,12 +109,13 @@ static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// 各分组框的位置与标题。`WM_PAINT` 里按这份表统一绘制，
 /// 和创建控件的坐标保持一致（改坐标时两处要一起改）。
-const SECTIONS: [(&str, i32, i32, i32, i32); 5] = [
+const SECTIONS: [(&str, i32, i32, i32, i32); 6] = [
     ("记录保存", 16, 12, 512, 84),
     ("启动", 16, 104, 512, 62),
     ("文件监控（可分别开关，全部关闭时停止监控）", 16, 174, 512, 206),
     ("黑白名单模式", 16, 388, 512, 80),
     ("资源管理器右键菜单", 16, 476, 512, 88),
+    ("存储位置（路径切换在重启后生效）", 544, 12, 512, 552),
 ];
 
 /// 打开（或重新激活）设置窗口。
@@ -117,8 +145,8 @@ pub fn show() -> Result<()> {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            560,
-            672,
+            1096,
+            700,
             HWND::default(),
             HMENU::default(),
             instance,
@@ -206,6 +234,46 @@ unsafe extern "system" fn window_procedure(
             match wparam.0 & 0xFFFF {
                 ID_SAVE_BUTTON => {
                     save_and_apply(hwnd);
+                    LRESULT(0)
+                }
+                ID_SHARED_PATH_RADIO | ID_SEPARATE_PATH_RADIO => {
+                    change_path_mode(hwnd);
+                    LRESULT(0)
+                }
+                ID_BROWSE_SHARED_BUTTON => {
+                    browse_into(hwnd, ID_SHARED_PATH_EDIT, "选择配置和数据库共用目录");
+                    LRESULT(0)
+                }
+                ID_BROWSE_CONFIG_BUTTON => {
+                    browse_into(hwnd, ID_CONFIG_PATH_EDIT, "选择配置目录");
+                    LRESULT(0)
+                }
+                ID_BROWSE_DATA_BUTTON => {
+                    browse_into(hwnd, ID_DATA_PATH_EDIT, "选择数据库目录");
+                    LRESULT(0)
+                }
+                ID_PROGRAM_PATH_BUTTON => {
+                    match storage::program_data_dir() {
+                        Ok(path) => fill_shortcut_path(hwnd, path),
+                        Err(error) => show_warning(&format!("无法确定程序目录：{:#}", error)),
+                    }
+                    LRESULT(0)
+                }
+                ID_APPDATA_PATH_BUTTON => {
+                    match storage::default_location() {
+                        Ok(location) => fill_shortcut_path(hwnd, location.config_dir),
+                        Err(error) => show_warning(&format!("无法确定默认目录：{:#}", error)),
+                    }
+                    LRESULT(0)
+                },
+                ID_CANCEL_SWITCH_BUTTON => {
+                    match storage::cancel_pending_switch() {
+                        Ok(()) => {
+                            load_values(hwnd);
+                            show_warning("已取消待重启执行的路径切换，当前位置没有改变。");
+                        }
+                        Err(error) => show_warning(&format!("取消路径切换失败：{:#}", error)),
+                    }
                     LRESULT(0)
                 }
                 ID_CLOSE_BUTTON => {
@@ -571,6 +639,9 @@ unsafe fn create_controls(window: HWND) {
         font,
     );
 
+    // ---- 右栏：配置与数据库存储位置 ----
+    create_storage_controls(window, font);
+
     // ---- 底部按钮：从左到右依次是「关于」「保存」「关闭」，符合 Windows 习惯 ----
     set_font(
         create_control(
@@ -579,7 +650,7 @@ unsafe fn create_controls(window: HWND) {
             "关于",
             button_style,
             204,
-            580,
+            600,
             100,
             32,
             window,
@@ -594,7 +665,7 @@ unsafe fn create_controls(window: HWND) {
             "保存",
             button_style,
             316,
-            580,
+            600,
             100,
             32,
             window,
@@ -609,7 +680,7 @@ unsafe fn create_controls(window: HWND) {
             "关闭",
             button_style,
             428,
-            580,
+            600,
             100,
             32,
             window,
@@ -620,6 +691,263 @@ unsafe fn create_controls(window: HWND) {
 
     // 复选框 / 单选框统一换成几何风格的自绘外观（点击与取值逻辑不变）。
     crate::theme::style_children(window);
+}
+
+/// 创建右栏的存储位置控件。路径编辑框不支持数字限制，可输入完整 Windows 路径。
+unsafe fn create_storage_controls(
+    window: HWND,
+    font: windows::Win32::Graphics::Gdi::HFONT,
+) {
+    let label_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0);
+    let button_style =
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32);
+    let radio_style = WINDOW_STYLE(
+        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTORADIOBUTTON as u32,
+    );
+    let grouped_radio_style = WINDOW_STYLE(radio_style.0 | 0x8); // WS_GROUP：开始新单选组
+    let path_style =
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL as u32);
+
+    // 这个小闭包只负责“创建后设置字体”，让下面的坐标和文字更容易核对。
+    let add = |ex_style, class, text, style, x, y, width, height, id| unsafe {
+        let control = create_control(
+            ex_style, class, text, style, x, y, width, height, window, id,
+        );
+        set_font(control, font);
+        control
+    };
+
+    add(
+        WINDOW_EX_STYLE::default(),
+        "BUTTON",
+        "配置和数据库共用同一目录",
+        grouped_radio_style,
+        562,
+        34,
+        250,
+        24,
+        ID_SHARED_PATH_RADIO,
+    );
+    add(
+        WINDOW_EX_STYLE::default(),
+        "BUTTON",
+        "使用两个独立路径",
+        radio_style,
+        820,
+        34,
+        210,
+        24,
+        ID_SEPARATE_PATH_RADIO,
+    );
+
+    add(
+        WINDOW_EX_STYLE::default(),
+        "STATIC",
+        "共用目录：",
+        label_style,
+        562,
+        72,
+        90,
+        22,
+        ID_SHARED_PATH_LABEL,
+    );
+    add(
+        WS_EX_CLIENTEDGE,
+        "EDIT",
+        "",
+        path_style,
+        654,
+        66,
+        300,
+        26,
+        ID_SHARED_PATH_EDIT,
+    );
+    add(
+        WINDOW_EX_STYLE::default(),
+        "BUTTON",
+        "浏览…",
+        button_style,
+        962,
+        64,
+        76,
+        30,
+        ID_BROWSE_SHARED_BUTTON,
+    );
+
+    add(
+        WINDOW_EX_STYLE::default(),
+        "STATIC",
+        "配置目录：",
+        label_style,
+        562,
+        72,
+        90,
+        22,
+        ID_CONFIG_PATH_LABEL,
+    );
+    add(
+        WS_EX_CLIENTEDGE,
+        "EDIT",
+        "",
+        path_style,
+        654,
+        66,
+        300,
+        26,
+        ID_CONFIG_PATH_EDIT,
+    );
+    add(
+        WINDOW_EX_STYLE::default(),
+        "BUTTON",
+        "浏览…",
+        button_style,
+        962,
+        64,
+        76,
+        30,
+        ID_BROWSE_CONFIG_BUTTON,
+    );
+    add(
+        WINDOW_EX_STYLE::default(),
+        "STATIC",
+        "数据库目录：",
+        label_style,
+        562,
+        112,
+        90,
+        22,
+        ID_DATA_PATH_LABEL,
+    );
+    add(
+        WS_EX_CLIENTEDGE,
+        "EDIT",
+        "",
+        path_style,
+        654,
+        106,
+        300,
+        26,
+        ID_DATA_PATH_EDIT,
+    );
+    add(
+        WINDOW_EX_STYLE::default(),
+        "BUTTON",
+        "浏览…",
+        button_style,
+        962,
+        104,
+        76,
+        30,
+        ID_BROWSE_DATA_BUTTON,
+    );
+
+    add(
+        WINDOW_EX_STYLE::default(),
+        "BUTTON",
+        "程序目录下的数据文件夹",
+        button_style,
+        562,
+        150,
+        230,
+        30,
+        ID_PROGRAM_PATH_BUTTON,
+    );
+    add(
+        WINDOW_EX_STYLE::default(),
+        "BUTTON",
+        "默认 AppData\\Local 目录",
+        button_style,
+        804,
+        150,
+        234,
+        30,
+        ID_APPDATA_PATH_BUTTON,
+    );
+
+    add(
+        WINDOW_EX_STYLE::default(),
+        "STATIC",
+        "路径切换方式：",
+        label_style,
+        562,
+        196,
+        200,
+        22,
+        0,
+    );
+    add(
+        WINDOW_EX_STYLE::default(),
+        "BUTTON",
+        "迁移现有配置和记录，成功后删除原文件",
+        grouped_radio_style,
+        562,
+        220,
+        470,
+        24,
+        ID_MIGRATE_RADIO,
+    );
+    add(
+        WINDOW_EX_STYLE::default(),
+        "BUTTON",
+        "保留设置并创建空数据库，不删除原位置数据",
+        radio_style,
+        562,
+        248,
+        470,
+        24,
+        ID_FRESH_RADIO,
+    );
+    add(
+        WINDOW_EX_STYLE::default(),
+        "STATIC",
+        "",
+        label_style,
+        562,
+        282,
+        470,
+        44,
+        ID_SWITCH_STATUS_LABEL,
+    );
+    add(
+        WINDOW_EX_STYLE::default(),
+        "BUTTON",
+        "取消待生效切换",
+        button_style,
+        562,
+        334,
+        180,
+        30,
+        ID_CANCEL_SWITCH_BUTTON,
+    );
+    add(
+        WINDOW_EX_STYLE::default(),
+        "STATIC",
+        "最近一次重新记录前的位置（可复制）：",
+        label_style,
+        562,
+        378,
+        400,
+        22,
+        0,
+    );
+    add(
+        WS_EX_CLIENTEDGE,
+        "EDIT",
+        "",
+        WINDOW_STYLE(
+            WS_CHILD.0
+                | WS_VISIBLE.0
+                | WS_TABSTOP.0
+                | WS_VSCROLL.0
+                | ES_MULTILINE as u32
+                | ES_READONLY as u32,
+        ),
+        562,
+        404,
+        476,
+        122,
+        ID_PREVIOUS_PATH_EDIT,
+    );
 }
 
 /// 创建一个子控件并返回句柄。
@@ -716,6 +1044,87 @@ fn load_values(window: HWND) {
         crate::theme::set_checked(child(window, ID_BLACKLIST_RADIO), !white);
         crate::theme::set_checked(child(window, ID_WHITELIST_RADIO), white);
     }
+
+    if let Err(error) = load_storage_values(window) {
+        log::warn!("[设置] 读取存储位置失败：{:#}", error);
+        show_warning(&format!("读取存储位置失败：{:#}", error));
+    }
+}
+
+/// 回填存储路径。有待切换任务时显示目标路径，否则显示当前生效路径。
+fn load_storage_values(window: HWND) -> Result<()> {
+    let state = storage::load_state()?;
+    let (location, mode, pending) = match state.pending.as_ref() {
+        Some(pending) => (pending.target.clone(), pending.mode, true),
+        None => (state.active.clone(), SwitchMode::Migrate, false),
+    };
+    let shared = storage::paths_equal(&location.config_dir, &location.data_dir);
+
+    unsafe {
+        crate::theme::set_checked(child(window, ID_SHARED_PATH_RADIO), shared);
+        crate::theme::set_checked(child(window, ID_SEPARATE_PATH_RADIO), !shared);
+        crate::theme::set_checked(
+            child(window, ID_MIGRATE_RADIO),
+            mode == SwitchMode::Migrate,
+        );
+        crate::theme::set_checked(child(window, ID_FRESH_RADIO), mode == SwitchMode::Fresh);
+    }
+
+    set_text(
+        window,
+        ID_SHARED_PATH_EDIT,
+        &location.config_dir.to_string_lossy(),
+    );
+    set_text(
+        window,
+        ID_CONFIG_PATH_EDIT,
+        &location.config_dir.to_string_lossy(),
+    );
+    set_text(
+        window,
+        ID_DATA_PATH_EDIT,
+        &location.data_dir.to_string_lossy(),
+    );
+
+    let status = if pending {
+        format!(
+            "已保存待切换任务（{}）。\n完全退出并重启主程序后生效，当前仍使用原位置。",
+            if mode == SwitchMode::Migrate {
+                "迁移数据"
+            } else {
+                "重新记录"
+            }
+        )
+    } else {
+        "当前显示的是正在使用的存储位置。".to_string()
+    };
+    set_text(window, ID_SWITCH_STATUS_LABEL, &status);
+
+    let previous = state.previous.map(|location| {
+        if storage::paths_equal(&location.config_dir, &location.data_dir) {
+            format!("原共用目录：{}", location.config_dir.display())
+        } else {
+            format!(
+                "原配置目录：{}\r\n原数据库目录：{}",
+                location.config_dir.display(),
+                location.data_dir.display()
+            )
+        }
+    });
+    set_text(
+        window,
+        ID_PREVIOUS_PATH_EDIT,
+        previous.as_deref().unwrap_or("暂无记录。"),
+    );
+
+    unsafe {
+        let _ = ShowWindow(
+            child(window, ID_CANCEL_SWITCH_BUTTON),
+            if pending { SW_SHOWNORMAL } else { SW_HIDE },
+        );
+    }
+    update_path_mode(window);
+    Ok(())
 }
 
 /// 读取控件值、保存到配置文件，并立即生效。
@@ -769,10 +1178,51 @@ fn save_and_apply(window: HWND) {
     config.monitor_delete_dir = monitor_delete_dir;
     config.list_mode = list_mode.to_string();
 
+    let storage_state = match storage::load_state() {
+        Ok(state) => state,
+        Err(error) => {
+            show_warning(&format!("读取存储位置失败：{:#}", error));
+            return;
+        }
+    };
+    let target = selected_storage_location(window);
+    let path_changed = !storage::paths_equal(&target.config_dir, &storage_state.active.config_dir)
+        || !storage::paths_equal(&target.data_dir, &storage_state.active.data_dir);
+    let switch_mode = if read_check(window, ID_FRESH_RADIO) {
+        SwitchMode::Fresh
+    } else {
+        SwitchMode::Migrate
+    };
+    let had_pending = storage_state.pending.is_some();
+    let mut path_error = None;
+
+    // 路径恢复成当前值时，同时撤销尚未执行的任务。
+    if !path_changed && had_pending {
+        if let Err(error) = storage::cancel_pending_switch() {
+            path_error = Some(format!("取消待切换任务失败：{error:#}"));
+        }
+    }
+
     if let Err(error) = config.save() {
         show_warning(&format!("保存配置失败：{:#}", error));
         return;
     }
+
+    // 修改已有任务时先撤销旧任务；新目标校验失败后就不会意外执行旧任务。
+    if path_changed && had_pending && path_error.is_none() {
+        if let Err(error) = storage::cancel_pending_switch() {
+            path_error = Some(format!("更新待切换任务失败：{error:#}"));
+        }
+    }
+
+    // 只登记任务，绝不在监控和数据库仍运行时搬动文件。
+    if path_changed && path_error.is_none() {
+        if let Err(error) = storage::schedule_switch(target, switch_mode, &config) {
+            path_error = Some(format!("保存路径切换任务失败：{error:#}"));
+        }
+    }
+    let restart_required = path_changed && path_error.is_none();
+    let switch_cancelled = !path_changed && had_pending && path_error.is_none();
 
     // 1. 开机自启：写入/删除注册表 Run 项。
     if let Err(error) = set_autostart(autostart) {
@@ -810,17 +1260,31 @@ fn save_and_apply(window: HWND) {
             .map(|entries| entries.is_empty())
             .unwrap_or(false);
 
-    let message = if white_list_empty {
-        "设置已保存并立即生效。\n\n注意：当前是白名单模式，但白名单还是空的，\n所以现在不会记录任何文件。\n请点「管理名单…」添加程序或文件夹。"
+    if let Some(error) = path_error {
+        show_warning(&format!(
+            "普通设置已经保存并应用，但存储路径没有改变。\n\n{error}"
+        ));
+        return;
+    }
+
+    let mut message = if restart_required {
+        "普通设置已保存并立即生效。\n\n路径切换将在完全退出并重新启动主程序后执行。\n重启前仍使用原配置和数据库。".to_string()
+    } else if switch_cancelled {
+        "设置已保存，待重启执行的路径切换已取消。".to_string()
     } else {
-        "设置已保存并立即生效。"
+        "设置已保存并立即生效。".to_string()
     };
+    if white_list_empty {
+        message.push_str(
+            "\n\n注意：当前是白名单模式，但白名单还是空的，\n所以现在不会记录任何文件。\n请点「管理名单…」添加程序或文件夹。",
+        );
+    }
 
     unsafe {
         // 以设置窗口为所有者，消息框不会跑到窗口后面。
         let _ = MessageBoxW(
             window,
-            PCWSTR(wide(message).as_ptr()),
+            PCWSTR(wide(&message).as_ptr()),
             PCWSTR(wide("文件来源追踪").as_ptr()),
             MB_OK,
         );
@@ -907,6 +1371,118 @@ fn unregister_shell_menu(window: HWND) {
     }
 }
 
+/// 按共用 / 独立模式读取用户当前填写的目录。
+fn selected_storage_location(window: HWND) -> StorageLocation {
+    if read_check(window, ID_SHARED_PATH_RADIO) {
+        let directory = PathBuf::from(read_text(window, ID_SHARED_PATH_EDIT).trim());
+        StorageLocation {
+            config_dir: directory.clone(),
+            data_dir: directory,
+        }
+    } else {
+        StorageLocation {
+            config_dir: PathBuf::from(read_text(window, ID_CONFIG_PATH_EDIT).trim()),
+            data_dir: PathBuf::from(read_text(window, ID_DATA_PATH_EDIT).trim()),
+        }
+    }
+}
+
+/// 用户主动切换模式时携带当前输入，避免隐藏编辑框里的旧值覆盖新路径。
+fn change_path_mode(window: HWND) {
+    if read_check(window, ID_SHARED_PATH_RADIO) {
+        let config_path = read_text(window, ID_CONFIG_PATH_EDIT);
+        if !config_path.trim().is_empty() {
+            set_text(window, ID_SHARED_PATH_EDIT, &config_path);
+        }
+    } else {
+        let shared_path = read_text(window, ID_SHARED_PATH_EDIT);
+        if !shared_path.trim().is_empty() {
+            set_text(window, ID_CONFIG_PATH_EDIT, &shared_path);
+            set_text(window, ID_DATA_PATH_EDIT, &shared_path);
+        }
+    }
+    update_path_mode(window);
+}
+
+/// 切换共用 / 独立模式时，只显示对应的路径行，避免两套输入框重叠。
+fn update_path_mode(window: HWND) {
+    let shared = read_check(window, ID_SHARED_PATH_RADIO);
+    for id in [
+        ID_SHARED_PATH_LABEL,
+        ID_SHARED_PATH_EDIT,
+        ID_BROWSE_SHARED_BUTTON,
+    ] {
+        unsafe {
+            let _ = ShowWindow(child(window, id), if shared { SW_SHOWNORMAL } else { SW_HIDE });
+        }
+    }
+    for id in [
+        ID_CONFIG_PATH_LABEL,
+        ID_CONFIG_PATH_EDIT,
+        ID_BROWSE_CONFIG_BUTTON,
+        ID_DATA_PATH_LABEL,
+        ID_DATA_PATH_EDIT,
+        ID_BROWSE_DATA_BUTTON,
+    ] {
+        unsafe {
+            let _ = ShowWindow(child(window, id), if shared { SW_HIDE } else { SW_SHOWNORMAL });
+        }
+    }
+}
+
+/// 快捷目录只负责填值，不会立即创建目录或移动数据。
+fn fill_shortcut_path(window: HWND, path: PathBuf) {
+    let text = path.to_string_lossy();
+    if read_check(window, ID_SHARED_PATH_RADIO) {
+        set_text(window, ID_SHARED_PATH_EDIT, &text);
+    } else {
+        set_text(window, ID_CONFIG_PATH_EDIT, &text);
+        set_text(window, ID_DATA_PATH_EDIT, &text);
+    }
+}
+
+/// 使用系统文件夹选择器选择目录，并填入指定编辑框。
+fn browse_into(window: HWND, edit_id: usize, title: &str) {
+    let mut display_name = [0u16; 260];
+    let title = wide(title);
+    let mut browse = BROWSEINFOW::default();
+    browse.hwndOwner = window;
+    browse.pszDisplayName = PWSTR(display_name.as_mut_ptr());
+    browse.lpszTitle = PCWSTR(title.as_ptr());
+    browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+    let pidl = unsafe { SHBrowseForFolderW(&browse) };
+    if pidl.is_null() {
+        return;
+    }
+    let mut buffer = [0u16; 260];
+    let ok = unsafe { SHGetPathFromIDListW(pidl, &mut buffer) };
+    unsafe { CoTaskMemFree(Some(pidl as *const c_void)) };
+    if !ok.as_bool() {
+        return;
+    }
+
+    let length = buffer
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(buffer.len());
+    let path = String::from_utf16_lossy(&buffer[..length]);
+    if !path.is_empty() {
+        set_text(window, edit_id, &path);
+    }
+}
+
+fn set_text(window: HWND, id: usize, text: &str) {
+    let control = child(window, id);
+    if control.0.is_null() {
+        return;
+    }
+    let text = wide(text);
+    unsafe {
+        let _ = SetWindowTextW(control, PCWSTR(text.as_ptr()));
+    }
+}
+
 fn child(window: HWND, id: usize) -> HWND {
     unsafe {
         windows::Win32::UI::WindowsAndMessaging::GetDlgItem(window, id as i32).unwrap_or_default()
@@ -918,7 +1494,9 @@ fn read_text(window: HWND, id: usize) -> String {
     if control.0.is_null() {
         return String::new();
     }
-    let mut buffer = vec![0u16; 64];
+    // 路径可能长于普通设置文本，按控件实际长度分配缓冲区。
+    let capacity = unsafe { GetWindowTextLengthW(control) }.max(0) as usize + 1;
+    let mut buffer = vec![0u16; capacity];
     let length = unsafe { GetWindowTextW(control, &mut buffer) };
     String::from_utf16_lossy(&buffer[..length.max(0) as usize])
 }

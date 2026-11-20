@@ -20,7 +20,7 @@ use std::io::Write;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use file_origin_tracker_shell::{config, db, etw, shell_menu, tray};
+use file_origin_tracker_shell::{config, db, etw, shell_menu, storage, tray};
 
 /// 简单的文件日志器：把日志写入数据目录下的 `file_origin_tracker.log`。
 ///
@@ -236,6 +236,22 @@ fn show_monitor_start_failure(detail: &str) {
     }
 }
 
+/// 存储路径损坏或迁移失败时给出可见提示；GUI 程序不能只依赖日志。
+fn show_storage_warning(title: &str, detail: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+
+    unsafe {
+        let _ = MessageBoxW(
+            HWND::default(),
+            &HSTRING::from(detail),
+            &HSTRING::from(title),
+            MB_OK | MB_ICONWARNING,
+        );
+    }
+}
+
 fn restart_as_admin() {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::HWND;
@@ -279,7 +295,16 @@ fn main() -> Result<()> {
     }));
 
     // 1. 初始化文件日志（必须在所有日志调用之前）。
-    let data_dir = config::Config::default_data_dir()?;
+    let data_dir = match config::Config::default_data_dir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            show_storage_warning(
+                "文件来源追踪 - 存储路径错误",
+                &format!("无法确定配置和数据库位置：\n{error:#}"),
+            );
+            return Err(error);
+        }
+    };
     let logger = FileLogger::new(&data_dir);
     // 设置全局日志器，忽略"已经设置过"的错误（多次启动时可能发生）。
     log::set_boxed_logger(Box::new(logger))
@@ -327,8 +352,44 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    // 4. 加载配置
-    let cfg = config::Config::load_or_default()?;
+    // 4. 只有这里可以执行待切换任务：已经提权并取得单实例锁，
+    //    数据库和 ETW 尚未打开，不会搬动正在写入的文件。
+    match storage::apply_pending_switch() {
+        Ok(report) => {
+            if report.switched {
+                info!("存储路径切换已完成：{:?}", report.mode);
+            }
+            if !report.warnings.is_empty() {
+                let message = report.warnings.join("\n");
+                warn!("存储清理提示：{}", message);
+                show_storage_warning(
+                    "文件来源追踪 - 原文件清理提示",
+                    &format!("新存储位置已经生效，但还有以下问题：\n\n{message}"),
+                );
+            }
+        }
+        Err(error) => {
+            log::error!("存储路径切换失败：{:#}", error);
+            show_storage_warning(
+                "文件来源追踪 - 路径切换失败",
+                &format!(
+                    "存储路径切换失败，程序将继续使用原位置。\n\n{error:#}\n\n请重新打开设置检查目标路径。"
+                ),
+            );
+        }
+    }
+
+    // 5. 切换成功后重新从当前生效位置加载配置。
+    let cfg = match config::Config::load_or_default() {
+        Ok(config) => config,
+        Err(error) => {
+            show_storage_warning(
+                "文件来源追踪 - 配置读取失败",
+                &format!("无法读取当前配置：\n{error:#}"),
+            );
+            return Err(error);
+        }
+    };
     info!("数据存储目录: {}", cfg.data_dir.display());
 
     // 5. 初始化数据库
