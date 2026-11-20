@@ -23,6 +23,7 @@
 //!   - 在程序行的某个计数单元格上右键 → 删除该程序这一类型的全部记录
 //!   - 在明细行上右键 → 删除这一条记录（都会先弹确认框）
 //! - 点击列头排序，再点一次切换升序 / 降序
+//! - 顶部搜索与「起 / 止」日期筛选可组合使用，汇总数字和展开明细保持同一时间口径
 //!
 //! 性能方面的考虑与「最近记录」窗口一致：
 //! - 只有窗口处于激活状态才每 10 秒刷新一次
@@ -32,17 +33,20 @@
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     InvalidateRect, ScreenToClient, SetBkColor, SetTextColor, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCFMT_LEFT, LVCFMT_RIGHT,
+    InitCommonControlsEx, DRAWITEMSTRUCT, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCFMT_LEFT,
+    LVCFMT_RIGHT,
     LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVIF_STATE, LVIF_TEXT, LVITEMW,
     LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_GETTOPINDEX, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
     LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
@@ -52,13 +56,16 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetClientRect, GetCursorPos,
-    InsertMenuW, KillTimer, LoadCursorW, MessageBoxW, MoveWindow, PostMessageW, RegisterClassExW,
-    SendMessageW, SetForegroundWindow, SetTimer, ShowWindow, TrackPopupMenu, HMENU, ICON_BIG,
-    ICON_SMALL, IDC_ARROW, IDYES, MB_ICONWARNING, MB_YESNO, MF_BYPOSITION, MF_SEPARATOR, MF_STRING,
-    SW_HIDE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, WA_INACTIVE,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC,
-    WM_NOTIFY, WM_NULL, WM_SETFONT, WM_SETICON, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSEXW,
-    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    GetWindowTextW, InsertMenuW, KillTimer, LoadCursorW, MessageBoxW, MoveWindow, PostMessageW,
+    RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer, ShowWindow, TrackPopupMenu,
+    BS_AUTOCHECKBOX, BS_OWNERDRAW, ES_AUTOHSCROLL, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW, IDYES,
+    MB_ICONWARNING, MB_YESNO,
+    MF_BYPOSITION, MF_SEPARATOR, MF_STRING, SW_HIDE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
+    TPM_TOPALIGN, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_NOTIFY, WM_NULL, WM_SETFONT,
+    WM_SETICON,
+    WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 use crate::db::{Database, FileOrigin, ProgramStat};
@@ -74,11 +81,25 @@ const REFRESH_INTERVAL_MS: u32 = 10_000;
 /// 单个程序、单个类型最多展开多少条明细。
 const MAX_DETAIL_ROWS: u32 = 500;
 
-/// 顶部提示文字区域的高度。
-const TIP_HEIGHT: i32 = 32;
+/// 第一行工具栏高 32px；提示文字从 36px 开始，与搜索框只留 4px 间距。
+/// 列表从 60px 开始，避免旧布局中搜索框下方出现过大的空白。
+const TIP_TOP: i32 = 36;
+const TOOLBAR_HEIGHT: i32 = 60;
 
 /// 列表控件 ID，用于在 WM_NOTIFY 中确认通知来源。
 const LIST_CONTROL_ID: usize = 1;
+/// 搜索框 ID，用于在 WM_COMMAND 中识别输入内容变化。
+const SEARCH_CONTROL_ID: usize = 2;
+/// EDIT 控件的 EN_CHANGE 通知码：用户输入、粘贴或清空文字时都会触发。
+const EN_CHANGE_CODE: u32 = 0x0300;
+/// 统计页日期筛选使用独立 ID，不与最近记录窗口的控件 ID 冲突。
+const FILTER_START_PICKER_ID: usize = 5101;
+const FILTER_END_PICKER_ID: usize = 5102;
+const FILTER_START_ENABLE_ID: usize = 5103;
+const FILTER_END_ENABLE_ID: usize = 5104;
+const FILTER_CLEAR_BUTTON_ID: usize = 5105;
+/// 「导出 Excel」按钮使用独立 ID，避免与统计筛选和右键菜单命令混淆。
+const EXPORT_BUTTON_ID: usize = 5106;
 
 /// 列定义：（标题，宽度）。
 ///
@@ -86,11 +107,11 @@ const LIST_CONTROL_ID: usize = 1;
 /// 第 1~5 列是五类计数，第 6 列是合计。
 const COLUMNS: [(&str, i32); 7] = [
     ("程序", 560),
-    ("创建文件", 80),
-    ("创建文件夹", 90),
+    ("创建文件", 100),
+    ("创建文件夹", 115),
     ("修改", 70),
-    ("删除文件", 80),
-    ("删除文件夹", 90),
+    ("删除文件", 100),
+    ("删除文件夹", 115),
     ("合计", 80),
 ];
 
@@ -136,6 +157,14 @@ const SB_LINEDOWN: usize = 1;
 
 static STATS_WINDOW: AtomicIsize = AtomicIsize::new(0);
 static LIST_VIEW: AtomicIsize = AtomicIsize::new(0);
+static SEARCH_EDIT: AtomicIsize = AtomicIsize::new(0);
+/// 日期筛选的两个时间框、起止值和启用复选框，行为与最近记录页一致。
+static FILTER_START_FIELD: AtomicIsize = AtomicIsize::new(0);
+static FILTER_END_FIELD: AtomicIsize = AtomicIsize::new(0);
+static FILTER_START_VALUE: AtomicI64 = AtomicI64::new(0);
+static FILTER_END_VALUE: AtomicI64 = AtomicI64::new(0);
+static FILTER_START_ENABLE: AtomicIsize = AtomicIsize::new(0);
+static FILTER_END_ENABLE: AtomicIsize = AtomicIsize::new(0);
 
 /// 当前排序列。默认 6（合计），降序：写得最多的程序排最前面。
 static SORT_COLUMN: AtomicIsize = AtomicIsize::new(TOTAL_COLUMN as isize);
@@ -270,8 +299,33 @@ unsafe extern "system" fn window_procedure(
             LRESULT(0)
         }
         WM_COMMAND => {
-            // 右键菜单选择的命令会以 WM_COMMAND 回到这里。
-            match (wparam.0 & 0xFFFF) as u32 {
+            // 与最近记录页一致：先切换并立即重绘主题复选框，再执行日期筛选。
+            crate::theme::apply_click_state(wparam, lparam);
+            let id = (wparam.0 & 0xFFFF) as u32;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            // 右键菜单和搜索框的通知都通过 WM_COMMAND 回到这里。
+            match id {
+                // 只过滤内存里的汇总缓存，不在每次按键时查询数据库。
+                _ if id == SEARCH_CONTROL_ID as u32 && code == EN_CHANGE_CODE => {
+                    // 新条件从顶部开始展示，避免沿用旧列表的滚动位置而看不到结果。
+                    rebuild(false);
+                }
+                _ if id == EXPORT_BUTTON_ID as u32 => {
+                    crate::history::export_stats_to_excel(hwnd)
+                }
+                _ if id == FILTER_CLEAR_BUTTON_ID as u32 => clear_time_filter(),
+                _ if id == FILTER_START_PICKER_ID as u32
+                    || id == FILTER_END_PICKER_ID as u32 =>
+                {
+                    open_time_popup(hwnd, id as usize);
+                }
+                _ if id == FILTER_START_ENABLE_ID as u32
+                    || id == FILTER_END_ENABLE_ID as u32 =>
+                {
+                    repaint_filter_fields();
+                    // 即使两个范围的汇总数字碰巧相同，也要重建可能已展开的明细。
+                    reload_stats(false);
+                }
                 MENU_DELETE_PROGRAM => delete_program_command(hwnd),
                 MENU_DELETE_RECORD => delete_record_command(hwnd),
                 MENU_DELETE_ACTION => delete_action_command(hwnd),
@@ -341,8 +395,38 @@ unsafe extern "system" fn window_procedure(
             }
             LRESULT(0)
         }
-        WM_CTLCOLORSTATIC => {
-            // 顶部提示文字的背景与窗口一致（白色），避免出现灰色块。
+        WM_DRAWITEM => {
+            let info = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            // 复选框由 theme 的子类过程绘制，这里只处理统计页自己的按钮。
+            if crate::theme::is_themed_control(info.hwndItem) {
+                return LRESULT(1);
+            }
+            if info.CtlID as usize == FILTER_START_PICKER_ID {
+                crate::datetime_popup::draw_field(
+                    info,
+                    &field_text(&FILTER_START_VALUE),
+                    checkbox_checked(&FILTER_START_ENABLE),
+                );
+                return LRESULT(1);
+            }
+            if info.CtlID as usize == FILTER_END_PICKER_ID {
+                crate::datetime_popup::draw_field(
+                    info,
+                    &field_text(&FILTER_END_VALUE),
+                    checkbox_checked(&FILTER_END_ENABLE),
+                );
+                return LRESULT(1);
+            }
+            if info.CtlID as usize == FILTER_CLEAR_BUTTON_ID
+                || info.CtlID as usize == EXPORT_BUTTON_ID
+            {
+                crate::theme::draw_button_auto(info, false);
+                return LRESULT(1);
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
+            // 顶部提示文字、搜索框和筛选标签的背景与窗口一致（白色）。
             let device = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
             SetBkColor(device, COLORREF(0x00FF_FFFF));
             SetTextColor(device, COLORREF(0x0020_2020));
@@ -381,7 +465,7 @@ unsafe extern "system" fn window_procedure(
     }
 }
 
-/// 创建窗口里的控件：一行提示文字 + 统计列表。
+/// 创建窗口里的控件：顶部搜索框 + 操作提示 + 统计列表。
 unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     // ListView 属于通用控件，必须先初始化。
     let controls = INITCOMMONCONTROLSEX {
@@ -391,21 +475,198 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     let _ = InitCommonControlsEx(&controls);
 
     let font = crate::util::ui_font();
+    let label_class = wide("STATIC");
 
-    // 顶部操作提示：告诉用户「展开」是怎么操作的，否则很容易不知道该点哪里。
-    let tip_class = wide("STATIC");
+    // 搜索栏放在窗口最上方，与「最近记录」窗口保持一致的入口和外观。
+    let search_label_text = wide("搜索");
+    if let Ok(label) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(label_class.as_ptr()),
+        PCWSTR(search_label_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE,
+        12,
+        13,
+        40,
+        20,
+        window,
+        HMENU::default(),
+        instance,
+        None,
+    ) {
+        SendMessageW(label, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+
+    // ES_AUTOHSCROLL 让长关键字可以横向滚动；WS_TABSTOP 支持键盘 Tab 聚焦。
+    let edit_class = wide("EDIT");
+    if let Ok(edit) = CreateWindowExW(
+        WINDOW_EX_STYLE(0x0000_0200), // WS_EX_CLIENTEDGE：输入框边框
+        PCWSTR(edit_class.as_ptr()),
+        PCWSTR::null(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+        56,
+        8,
+        160,
+        24,
+        window,
+        HMENU(SEARCH_CONTROL_ID as *mut c_void),
+        instance,
+        None,
+    ) {
+        SEARCH_EDIT.store(edit.0 as isize, Ordering::SeqCst);
+        SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+
+    // ===== 同一行右侧：与最近记录页相同的日期时间筛选 =====
+    let filter_label_text = wide("筛选时间");
+    if let Ok(label) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(label_class.as_ptr()),
+        PCWSTR(filter_label_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE,
+        312,
+        13,
+        60,
+        20,
+        window,
+        HMENU::default(),
+        instance,
+        None,
+    ) {
+        SendMessageW(label, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+
+    // 勾选后才启用对应端；不勾选时该端不限时间。
+    let button_class = wide("BUTTON");
+    let start_enable_text = wide("起");
+    let end_enable_text = wide("止");
+    for (id, x, text) in [
+        (FILTER_START_ENABLE_ID, 376, &start_enable_text),
+        (FILTER_END_ENABLE_ID, 638, &end_enable_text),
+    ] {
+        if let Ok(checkbox) = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            PCWSTR(button_class.as_ptr()),
+            PCWSTR(text.as_ptr()),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
+            x,
+            11,
+            38,
+            20,
+            window,
+            HMENU(id as *mut c_void),
+            instance,
+            None,
+        ) {
+            if id == FILTER_START_ENABLE_ID {
+                FILTER_START_ENABLE.store(checkbox.0 as isize, Ordering::SeqCst);
+            } else {
+                FILTER_END_ENABLE.store(checkbox.0 as isize, Ordering::SeqCst);
+            }
+            SendMessageW(checkbox, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        }
+    }
+
+    // 点击自绘时间框，打开和最近记录页完全相同的日期时间浮窗。
+    let field_style =
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32);
+    for (id, x, target) in [
+        (FILTER_START_PICKER_ID, 418, &FILTER_START_FIELD),
+        (FILTER_END_PICKER_ID, 680, &FILTER_END_FIELD),
+    ] {
+        if let Ok(field) = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            PCWSTR(button_class.as_ptr()),
+            PCWSTR::null(),
+            field_style,
+            x,
+            8,
+            190,
+            24,
+            window,
+            HMENU(id as *mut c_void),
+            instance,
+            None,
+        ) {
+            target.store(field.0 as isize, Ordering::SeqCst);
+            SendMessageW(field, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        }
+    }
+
+    // 默认值只用于待选显示：起=今天 00:00:00，止=当前时间；复选框默认不勾选。
+    let now = current_unix();
+    FILTER_START_VALUE.store(local_midnight(now), Ordering::SeqCst);
+    FILTER_END_VALUE.store(now, Ordering::SeqCst);
+    repaint_filter_fields();
+
+    let to_text = wide("至");
+    if let Ok(label) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(label_class.as_ptr()),
+        PCWSTR(to_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE,
+        614,
+        13,
+        20,
+        20,
+        window,
+        HMENU::default(),
+        instance,
+        None,
+    ) {
+        SendMessageW(label, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+
+    let clear_text = wide("清除筛选");
+    if let Ok(button) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(button_class.as_ptr()),
+        PCWSTR(clear_text.as_ptr()),
+        field_style,
+        878,
+        8,
+        84,
+        24,
+        window,
+        HMENU(FILTER_CLEAR_BUTTON_ID as *mut c_void),
+        instance,
+        None,
+    ) {
+        SendMessageW(button, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+
+    // 导出入口复用最近记录页的完整流程：选择条件 → 查询 → 另存为 xlsx。
+    // 导出条件在独立窗口里选择，不自动套用上面的统计搜索和日期筛选。
+    let export_text = wide("导出 Excel");
+    if let Ok(button) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(button_class.as_ptr()),
+        PCWSTR(export_text.as_ptr()),
+        field_style,
+        974,
+        8,
+        104,
+        24,
+        window,
+        HMENU(EXPORT_BUTTON_ID as *mut c_void),
+        instance,
+        None,
+    ) {
+        SendMessageW(button, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+
+    // 第二行提示紧贴工具栏：保留操作说明，同时压缩无效空白。
     let tip_text = wide("双击计数单元格展开该类型的明细，双击「合计」展开全部类型的明细，再双击收起；双击明细行打开文件所在目录；点击列头排序。");
     if let Ok(tip) = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
-        PCWSTR(tip_class.as_ptr()),
+        PCWSTR(label_class.as_ptr()),
         PCWSTR(tip_text.as_ptr()),
         WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
         12,
-        10,
+        TIP_TOP,
         1100,
         20,
         window,
-        windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
+        HMENU::default(),
         instance,
         None,
     ) {
@@ -421,7 +682,7 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
         PCWSTR::null(),
         list_style,
         0,
-        TIP_HEIGHT,
+        TOOLBAR_HEIGHT,
         100,
         100,
         window,
@@ -474,10 +735,12 @@ unsafe fn create_controls(window: HWND, instance: HINSTANCE) {
     update_sort_headers();
     // 列头统一改成几何风格（浅灰面板 + 细线 + 强调色排序三角）。
     crate::theme::style_list_header(list);
+    // 起 / 止复选框与最近记录页共用蓝色自绘外观和统一尺寸。
+    crate::theme::style_children(window);
     resize_controls(window, list);
 }
 
-/// 让提示文字和列表跟随窗口大小变化。
+/// 让统计列表跟随窗口大小变化，并始终位于搜索栏和提示文字下方。
 unsafe fn resize_controls(window: HWND, list: HWND) {
     let mut rect = RECT::default();
     if GetClientRect(window, &mut rect).is_err() {
@@ -487,8 +750,160 @@ unsafe fn resize_controls(window: HWND, list: HWND) {
     let client_height = rect.bottom - rect.top;
 
     let list_width = (client_width - 16).max(100);
-    let list_height = (client_height - TIP_HEIGHT - 8).max(100);
-    let _ = MoveWindow(list, 8, TIP_HEIGHT, list_width, list_height, true);
+    let list_height = (client_height - TOOLBAR_HEIGHT - 8).max(100);
+    let _ = MoveWindow(list, 8, TOOLBAR_HEIGHT, list_width, list_height, true);
+
+    // 计数列必须完整显示中文标题和排序箭头，因此只让程序列吸收宽度变化。
+    // 预留 28px 给边框和垂直滚动条，尽量避免出现不必要的横向滚动条。
+    let fixed_width: i32 = COLUMNS.iter().skip(1).map(|(_, width)| *width).sum();
+    let program_width = (list_width - fixed_width - 28).max(260);
+    let mut column = LVCOLUMNW::default();
+    column.mask = LVCF_WIDTH;
+    column.cx = program_width;
+    SendMessageW(
+        list,
+        LVM_SETCOLUMNW,
+        WPARAM(PROGRAM_COLUMN as usize),
+        LPARAM(&column as *const _ as isize),
+    );
+}
+
+/// 读取搜索框当前文字。控件尚未创建或创建失败时返回空串，表示不做筛选。
+fn search_text() -> String {
+    let edit = HWND(SEARCH_EDIT.load(Ordering::SeqCst) as *mut c_void);
+    if edit.0.is_null() {
+        return String::new();
+    }
+
+    let mut buffer = vec![0u16; 512];
+    let length = unsafe { GetWindowTextW(edit, &mut buffer) }.max(0) as usize;
+    String::from_utf16_lossy(&buffer[..length.min(buffer.len())])
+}
+
+/// 读取复选框状态。owner-draw 控件的勾选状态由 theme 统一保存。
+fn checkbox_checked(checkbox: &AtomicIsize) -> bool {
+    let hwnd = HWND(checkbox.load(Ordering::SeqCst) as *mut c_void);
+    if hwnd.0.is_null() {
+        return false;
+    }
+    unsafe { crate::theme::is_checked(hwnd) }
+}
+
+/// 取得当前时间范围：不勾选表示该端不限，起止颠倒时自动交换。
+fn time_filter_range() -> Option<(i64, i64)> {
+    let start = if checkbox_checked(&FILTER_START_ENABLE) {
+        Some(FILTER_START_VALUE.load(Ordering::SeqCst))
+    } else {
+        None
+    };
+    let end = if checkbox_checked(&FILTER_END_ENABLE) {
+        Some(FILTER_END_VALUE.load(Ordering::SeqCst))
+    } else {
+        None
+    };
+
+    match (start, end) {
+        (None, None) => None,
+        (Some(start), None) => Some((start, i64::MAX)),
+        (None, Some(end)) => Some((i64::MIN, end)),
+        (Some(start), Some(end)) => Some(if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        }),
+    }
+}
+
+/// 时间框显示的文字，例如 2026-11-20 20:30:00。
+fn field_text(value: &AtomicI64) -> String {
+    let seconds = value.load(Ordering::SeqCst);
+    if seconds <= 0 {
+        String::from("未设置")
+    } else {
+        crate::util::timestamp_to_local_text(seconds)
+    }
+}
+
+/// 数值或启用状态变化后立即重绘时间框，避免等待消息队列空闲。
+fn repaint_filter_fields() {
+    for handle in [&FILTER_START_FIELD, &FILTER_END_FIELD] {
+        let hwnd = HWND(handle.load(Ordering::SeqCst) as *mut c_void);
+        if !hwnd.0.is_null() {
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, true);
+                let _ = UpdateWindow(hwnd);
+            }
+        }
+    }
+}
+
+fn set_checkbox(handle: &AtomicIsize, checked: bool) {
+    let hwnd = HWND(handle.load(Ordering::SeqCst) as *mut c_void);
+    if !hwnd.0.is_null() {
+        unsafe { crate::theme::set_checked(hwnd, checked) };
+    }
+}
+
+/// 点击时间框打开日期浮窗；确定后自动启用对应端并立即刷新统计。
+fn open_time_popup(owner: HWND, control_id: usize) {
+    let (field_handle, value_handle, enable_handle) =
+        if control_id == FILTER_START_PICKER_ID {
+            (
+                &FILTER_START_FIELD,
+                &FILTER_START_VALUE,
+                &FILTER_START_ENABLE,
+            )
+        } else {
+            (&FILTER_END_FIELD, &FILTER_END_VALUE, &FILTER_END_ENABLE)
+        };
+
+    let field = HWND(field_handle.load(Ordering::SeqCst) as *mut c_void);
+    if field.0.is_null() {
+        return;
+    }
+
+    let current = value_handle.load(Ordering::SeqCst);
+    let initial = if current > 0 { current } else { current_unix() };
+    let Some(selected) = crate::datetime_popup::show(owner, field, initial) else {
+        return;
+    };
+
+    value_handle.store(selected, Ordering::SeqCst);
+    set_checkbox(enable_handle, true);
+    repaint_filter_fields();
+    reload_stats(false);
+}
+
+fn current_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 把某个时间戳转换为本地日期的 00:00:00，作为「起」的默认值。
+fn local_midnight(seconds: i64) -> i64 {
+    let local = crate::util::unix_to_local_system_time(seconds);
+    let midnight = SYSTEMTIME {
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+        ..local
+    };
+    crate::util::local_system_time_to_unix(&midnight).unwrap_or(seconds)
+}
+
+/// 清除筛选只取消两端启用状态，同时恢复默认待选时间，不删除任何记录。
+fn clear_time_filter() {
+    set_checkbox(&FILTER_START_ENABLE, false);
+    set_checkbox(&FILTER_END_ENABLE, false);
+
+    let now = current_unix();
+    FILTER_START_VALUE.store(local_midnight(now), Ordering::SeqCst);
+    FILTER_END_VALUE.store(now, Ordering::SeqCst);
+    repaint_filter_fields();
+    reload_stats(false);
 }
 
 /// 从数据库读取程序统计（失败时返回空列表）。
@@ -507,7 +922,7 @@ fn load_stats() -> Vec<ProgramStat> {
     }
 
     match guard.as_ref() {
-        Some(db) => db.program_stats().unwrap_or_default(),
+        Some(db) => db.program_stats(time_filter_range()).unwrap_or_default(),
         None => Vec::new(),
     }
 }
@@ -529,7 +944,7 @@ fn load_details(process_path: &str, action: &str) -> Vec<FileOrigin> {
 
     match guard.as_ref() {
         Some(db) => db
-            .records_by_process_action(process_path, action, MAX_DETAIL_ROWS)
+            .records_by_process_action(process_path, action, MAX_DETAIL_ROWS, time_filter_range())
             .unwrap_or_default(),
         None => Vec::new(),
     }
@@ -552,7 +967,7 @@ fn load_all_details(process_path: &str) -> Vec<FileOrigin> {
 
     match guard.as_ref() {
         Some(db) => db
-            .records_by_process(process_path, MAX_DETAIL_ROWS)
+            .records_by_process(process_path, MAX_DETAIL_ROWS, time_filter_range())
             .unwrap_or_default(),
         None => Vec::new(),
     }
@@ -595,16 +1010,46 @@ fn refresh_stats(keep_scroll: bool) {
     rebuild(keep_scroll);
 }
 
+/// 日期条件变化时强制重查并重建，不能像定时刷新一样因计数相同而提前返回。
+fn reload_stats(keep_scroll: bool) {
+    let stats = load_stats();
+    match ALL_STATS.lock() {
+        Ok(mut cache) => *cache = stats,
+        Err(poisoned) => *poisoned.into_inner() = stats,
+    }
+    rebuild(keep_scroll);
+}
+
 /// 按当前排序和展开状态重新生成整个列表。
 fn rebuild(keep_scroll: bool) {
     let mut stats = match ALL_STATS.lock() {
         Ok(cache) => cache.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     };
+    // 在克隆出来的临时列表上筛选，ALL_STATS 始终保存完整数据。
+    // 因此清空搜索后能立即恢复，不必重新访问数据库。
+    filter_stats(&mut stats, &search_text());
     sort_stats(&mut stats);
 
     let rows = build_rows(&stats);
     fill_list(&rows, keep_scroll);
+}
+
+/// 按程序名、完整路径或备注筛选汇总行。
+///
+/// 关键字只转小写一次，之后逐行比较；空关键字直接返回，避免无意义的字符串分配。
+/// 这里只决定哪些程序行可见，不修改任何计数，也不删除 EXPANDED 中的展开状态。
+fn filter_stats(stats: &mut Vec<ProgramStat>, keyword: &str) {
+    let keyword = keyword.trim().to_lowercase();
+    if keyword.is_empty() {
+        return;
+    }
+
+    stats.retain(|stat| {
+        stat.process_name.to_lowercase().contains(&keyword)
+            || stat.process_path.to_lowercase().contains(&keyword)
+            || stat.note.to_lowercase().contains(&keyword)
+    });
 }
 
 /// 把「程序行 + 已展开的明细行」拼成最终要显示的行序列。
@@ -1344,5 +1789,47 @@ fn action_label(action: &str) -> &'static str {
         "delete_file" => "删除文件",
         "delete_dir" => "删除文件夹",
         _ => "创建文件",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_stat(process_name: &str, process_path: &str, note: &str) -> ProgramStat {
+        ProgramStat {
+            process_name: process_name.to_string(),
+            process_path: process_path.to_string(),
+            note: note.to_string(),
+            create_file: 1,
+            create_dir: 2,
+            modify: 3,
+            delete_file: 4,
+            delete_dir: 5,
+        }
+    }
+
+    #[test]
+    fn filter_stats_matches_name_path_and_note() {
+        let target = sample_stat(
+            "SyncHost.exe",
+            r"C:\Windows\System32\SyncHost.exe",
+            "系统同步",
+        );
+        let other = sample_stat("chrome.exe", r"C:\Apps\chrome.exe", "浏览器");
+
+        // 三种字段都能命中，英文字母比较不区分大小写，且不会影响其它程序。
+        for keyword in ["SYNCHOST", r"windows\system32", "同步"] {
+            let mut stats = vec![target.clone(), other.clone()];
+            filter_stats(&mut stats, keyword);
+            assert_eq!(stats, vec![target.clone()]);
+        }
+
+        // 空白关键字显示全部；无匹配时显示空列表，原缓存数据不受影响。
+        let mut stats = vec![target, other];
+        filter_stats(&mut stats, "   ");
+        assert_eq!(stats.len(), 2);
+        filter_stats(&mut stats, "不存在的关键字");
+        assert!(stats.is_empty());
     }
 }

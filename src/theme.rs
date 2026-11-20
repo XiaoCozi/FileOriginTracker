@@ -17,9 +17,10 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, UpdateWindow,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DRAW_TEXT_FORMAT,
+    DT_LEFT, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    TRANSPARENT,
 };
 use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
 use windows::Win32::UI::Controls::{
@@ -446,7 +447,11 @@ pub unsafe fn apply_click_state(wparam: WPARAM, lparam: LPARAM) {
         }
     }
 
+    // InvalidateRect 只把控件标记为“需要重绘”，真正的 WM_PAINT 默认要等消息队列空闲。
+    // 部分窗口随后会查询数据库，如果只做标记，对勾就要等查询结束后才出现。
+    // UpdateWindow 会立即发送 WM_PAINT，让用户先看到勾选结果，再执行后续业务。
     let _ = InvalidateRect(control, None, true);
+    let _ = UpdateWindow(control);
 }
 
 /// 读取一个复选框 / 单选框当前是否被选中。
@@ -559,6 +564,8 @@ unsafe fn uncheck_other_radios(parent: HWND, control: HWND) {
         if matches!(kind, BS_AUTORADIOBUTTON_STYLE | BS_RADIOBUTTON_STYLE) {
             store_state(*sibling, 0);
             let _ = InvalidateRect(*sibling, None, true);
+            // 同组旧选项也立即取消显示，避免新旧选中状态短暂同时存在。
+            let _ = UpdateWindow(*sibling);
         }
     }
 }

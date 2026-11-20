@@ -803,8 +803,14 @@ impl Database {
     /// 做法是先把三张表 UNION 成一张统一视图（每行带 `action`），
     /// 再按 `process_path` 分组，用五个 `SUM(CASE WHEN ...)` 分别统计每类次数。
     /// 排序交给界面层处理（用户点哪列就按哪列排）。
-    pub fn program_stats(&self) -> Result<Vec<ProgramStat>> {
+    /// `range` 为 `None` 时统计全部时间；为 `Some((起, 止))` 时包含首尾秒。
+    pub fn program_stats(&self, range: Option<(i64, i64)>) -> Result<Vec<ProgramStat>> {
         let conn = self.lock_connection();
+        // 使用可空参数复用同一条 SQL；None 不会生成无意义的时间条件。
+        let (start, end) = match range {
+            Some((start, end)) => (Some(start), Some(end)),
+            None => (None, None),
+        };
         let mut stmt = conn.prepare(
             r#"
             SELECT MAX(t.process_name),
@@ -829,11 +835,12 @@ impl Database {
             ) AS t
             LEFT JOIN program_notes n ON n.process_path = t.process_path
             WHERE t.file_path <> '' AND t.process_name <> '' AND t.process_path <> ''
+              AND (?1 IS NULL OR (t.created_at >= ?1 AND t.created_at <= ?2))
             GROUP BY t.process_path
             "#,
         )?;
 
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![start, end], |row| {
             Ok(ProgramStat {
                 process_name: row.get(0)?,
                 process_path: row.get(1)?,
@@ -862,8 +869,13 @@ impl Database {
         process_path: &str,
         action: &str,
         limit: u32,
+        range: Option<(i64, i64)>,
     ) -> Result<Vec<FileOrigin>> {
         let conn = self.lock_connection();
+        let (start, end) = match range {
+            Some((start, end)) => (Some(start), Some(end)),
+            None => (None, None),
+        };
         let mut stmt = conn.prepare(
             r#"
             SELECT t.file_path, t.process_name, t.process_path, t.created_at, t.action,
@@ -882,12 +894,13 @@ impl Database {
             ) AS t
             LEFT JOIN program_notes n ON n.process_path = t.process_path
             WHERE t.process_path = ?1 AND t.action = ?2 AND t.file_path <> ''
+              AND (?4 IS NULL OR (t.created_at >= ?4 AND t.created_at <= ?5))
             ORDER BY t.created_at DESC
             LIMIT ?3
             "#,
         )?;
 
-        let rows = stmt.query_map(params![process_path, action, limit], |row| {
+        let rows = stmt.query_map(params![process_path, action, limit, start, end], |row| {
             Ok(FileOrigin {
                 file_path: row.get(0)?,
                 process_name: row.get(1)?,
@@ -909,8 +922,17 @@ impl Database {
     ///
     /// 双击统计窗口的「合计」列时调用它：创建文件、修改、删除等会混在一起，
     /// 方便看这个程序最近到底都干了什么。
-    pub fn records_by_process(&self, process_path: &str, limit: u32) -> Result<Vec<FileOrigin>> {
+    pub fn records_by_process(
+        &self,
+        process_path: &str,
+        limit: u32,
+        range: Option<(i64, i64)>,
+    ) -> Result<Vec<FileOrigin>> {
         let conn = self.lock_connection();
+        let (start, end) = match range {
+            Some((start, end)) => (Some(start), Some(end)),
+            None => (None, None),
+        };
         let mut stmt = conn.prepare(
             r#"
             SELECT t.file_path, t.process_name, t.process_path, t.created_at, t.action,
@@ -929,12 +951,13 @@ impl Database {
             ) AS t
             LEFT JOIN program_notes n ON n.process_path = t.process_path
             WHERE t.process_path = ?1 AND t.file_path <> ''
+              AND (?3 IS NULL OR (t.created_at >= ?3 AND t.created_at <= ?4))
             ORDER BY t.created_at DESC
             LIMIT ?2
             "#,
         )?;
 
-        let rows = stmt.query_map(params![process_path, limit], |row| {
+        let rows = stmt.query_map(params![process_path, limit, start, end], |row| {
             Ok(FileOrigin {
                 file_path: row.get(0)?,
                 process_name: row.get(1)?,
@@ -1397,7 +1420,7 @@ mod tests {
         db.upsert_origin(r"C:\b\two.txt", "b.exe", r"C:\b.exe", false)
             .unwrap();
 
-        let stats = db.program_stats().unwrap();
+        let stats = db.program_stats(None).unwrap();
         assert_eq!(stats.len(), 2);
 
         let a = stats
@@ -1420,14 +1443,14 @@ mod tests {
 
         // 明细必须严格按类型过滤：展开「创建文件夹」时不能混进创建文件。
         let folders = db
-            .records_by_process_action(r"C:\a.exe", "create_dir", 100)
+            .records_by_process_action(r"C:\a.exe", "create_dir", 100, None)
             .unwrap();
         assert_eq!(folders.len(), 1);
         assert_eq!(folders[0].file_path, r"C:\a\folder");
         assert_eq!(folders[0].action, "create_dir");
 
         let creates = db
-            .records_by_process_action(r"C:\a.exe", "create_file", 100)
+            .records_by_process_action(r"C:\a.exe", "create_file", 100, None)
             .unwrap();
         assert_eq!(creates.len(), 1);
         assert_eq!(creates[0].file_path, r"C:\a\one.txt");
@@ -1435,12 +1458,12 @@ mod tests {
 
         // 换一个程序查询同类型，结果不能串到程序 A 的数据。
         assert!(db
-            .records_by_process_action(r"C:\b.exe", "create_dir", 100)
+            .records_by_process_action(r"C:\b.exe", "create_dir", 100, None)
             .unwrap()
             .is_empty());
 
         // 「合计」展开会取全部类型：程序 A 应该有创建 / 修改 / 删除共 4 条。
-        let all_a = db.records_by_process(r"C:\a.exe", 100).unwrap();
+        let all_a = db.records_by_process(r"C:\a.exe", 100, None).unwrap();
         assert_eq!(all_a.len(), 4);
         // 结果按时间倒序，这里只验证类型齐全，不依赖具体顺序。
         let actions: Vec<&str> = all_a.iter().map(|row| row.action.as_str()).collect();
@@ -1449,7 +1472,34 @@ mod tests {
         assert!(actions.contains(&"modify"));
         assert!(actions.contains(&"delete_file"));
         // 另一个程序只有 1 条。
-        assert_eq!(db.records_by_process(r"C:\b.exe", 100).unwrap().len(), 1);
+        assert_eq!(db.records_by_process(r"C:\b.exe", 100, None).unwrap().len(), 1);
+
+        // 把程序 B 的记录固定到 Unix 100 秒，验证汇总和明细使用同一时间范围。
+        // 起止都传 100 也验证边界秒本身会被包含。
+        {
+            let conn = db.lock_connection();
+            conn.execute(
+                "UPDATE file_origins SET created_at = 100 WHERE process_path = 'C:\\b.exe'",
+                [],
+            )
+            .unwrap();
+        }
+        let range = Some((100, 100));
+        let filtered = db.program_stats(range).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].process_path, r"C:\b.exe");
+        assert_eq!(filtered[0].total(), 1);
+        assert_eq!(
+            db.records_by_process_action(r"C:\b.exe", "create_file", 100, range)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .records_by_process(r"C:\a.exe", 100, range)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.records_by_process(r"C:\b.exe", 100, range).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1479,7 +1529,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(db.records_by_process(r"C:\a.exe", 100).unwrap().len(), 3);
+        assert_eq!(db.records_by_process(r"C:\a.exe", 100, None).unwrap().len(), 3);
 
         // 单条删除：只删掉「创建文件」这一条，同路径的修改 / 删除记录必须保留。
         assert_eq!(db.delete_record(r"C:\a\one.txt", "create_file").unwrap(), 1);

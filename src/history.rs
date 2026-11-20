@@ -59,7 +59,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
-use crate::db::{Database, FileOrigin};
+use crate::db::{Database, FileOrigin, ProgramStat};
 use crate::util::wide;
 
 const WINDOW_TITLE: &str = "文件来源追踪 - 最近记录";
@@ -1823,6 +1823,19 @@ pub(crate) fn action_label(action: &str) -> String {
 /// 2. 按所选条件从数据库查询记录（不受列表 500 条上限限制）；
 /// 3. 让用户选择保存位置并写出 `.xlsx`。
 unsafe fn export_to_excel(window: HWND) {
+    export_with_layout(window, false);
+}
+
+/// 「程序统计」页的导出入口。
+///
+/// 与最近记录共用条件窗口和明细查询，但写出的工作簿会额外包含
+/// 「程序统计」工作表，方便先看汇总、再切换到明细逐条核对。
+pub(crate) unsafe fn export_stats_to_excel(window: HWND) {
+    export_with_layout(window, true);
+}
+
+/// 两个页面共用的导出流程；`include_stats_sheet` 决定是否增加汇总工作表。
+unsafe fn export_with_layout(window: HWND, include_stats_sheet: bool) {
     // 第一步：条件窗口。用户点「取消」时返回 None，直接结束。
     let Some(scope) = crate::export_dialog::show(window) else {
         return;
@@ -1853,7 +1866,13 @@ unsafe fn export_to_excel(window: HWND) {
         return;
     };
 
-    match write_xlsx(&path, &rows) {
+    let result = if include_stats_sheet {
+        write_stats_xlsx(&path, &rows)
+    } else {
+        write_xlsx(&path, &rows)
+    };
+
+    match result {
         Ok(()) => {
             let text = wide(&format!(
                 "已导出 {} 条记录到：\n{}",
@@ -1967,9 +1986,27 @@ fn ask_save_path(window: HWND) -> Option<std::path::PathBuf> {
 /// 使用 `rust_xlsxwriter`（纯 Rust，无外部运行库依赖），
 /// 生成的是标准 Excel 文件，可以直接用 Excel / WPS / LibreOffice 打开。
 fn write_xlsx(path: &std::path::Path, rows: &[FileOrigin]) -> Result<(), String> {
+    write_workbook(path, rows, false)
+}
+
+/// 统计页导出：第一张表是程序汇总，第二张表是同一批条件的逐条明细。
+fn write_stats_xlsx(path: &std::path::Path, rows: &[FileOrigin]) -> Result<(), String> {
+    write_workbook(path, rows, true)
+}
+
+/// 实际创建工作簿。最近记录只写明细表，统计页会先插入一张汇总表。
+fn write_workbook(
+    path: &std::path::Path,
+    rows: &[FileOrigin],
+    include_stats_sheet: bool,
+) -> Result<(), String> {
     use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook};
 
     let mut workbook = Workbook::new();
+    if include_stats_sheet {
+        add_stats_sheet(&mut workbook, rows)?;
+    }
+
     let sheet = workbook.add_worksheet();
     sheet
         .set_name("文件来源记录")
@@ -2043,6 +2080,131 @@ fn write_xlsx(path: &std::path::Path, rows: &[FileOrigin]) -> Result<(), String>
         .map_err(|error| error.to_string())?;
 
     workbook.save(path).map_err(|error| error.to_string())
+}
+
+/// 把明细按程序完整路径聚合，写入与「程序统计」主表一致的工作表。
+fn add_stats_sheet(
+    workbook: &mut rust_xlsxwriter::Workbook,
+    rows: &[FileOrigin],
+) -> Result<(), String> {
+    use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder};
+
+    let stats = aggregate_stats(rows);
+    let sheet = workbook.add_worksheet();
+    sheet
+        .set_name("程序统计")
+        .map_err(|error| error.to_string())?;
+
+    // 与明细工作表使用相同的表头配色，打开文件时风格统一。
+    let header = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0xE8_EE_F7))
+        .set_border(FormatBorder::Thin)
+        .set_align(FormatAlign::Center);
+
+    // 列名和顺序严格对应统计页主表；数字在 Excel 中仍是数值，可继续求和。
+    const HEADERS: [(&str, f64); 7] = [
+        ("程序", 34.0),
+        ("创建文件", 14.0),
+        ("创建文件夹", 16.0),
+        ("修改", 12.0),
+        ("删除文件", 14.0),
+        ("删除文件夹", 16.0),
+        ("合计", 12.0),
+    ];
+    for (column, (title, width)) in HEADERS.iter().enumerate() {
+        let column = column as u16;
+        sheet
+            .set_column_width(column, *width)
+            .map_err(|error| error.to_string())?;
+        sheet
+            .write_string_with_format(0, column, *title, &header)
+            .map_err(|error| error.to_string())?;
+    }
+
+    for (index, stat) in stats.iter().enumerate() {
+        let line = index as u32 + 1;
+        sheet
+            .write_string(line, 0, program_stat_text(stat))
+            .map_err(|error| error.to_string())?;
+        let counts = [
+            stat.create_file,
+            stat.create_dir,
+            stat.modify,
+            stat.delete_file,
+            stat.delete_dir,
+            stat.total(),
+        ];
+        for (offset, count) in counts.iter().enumerate() {
+            sheet
+                .write_number(line, offset as u16 + 1, *count as f64)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    sheet
+        .set_freeze_panes(1, 0)
+        .map_err(|error| error.to_string())?;
+    sheet
+        .autofilter(0, 0, stats.len() as u32, HEADERS.len() as u16 - 1)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 将导出明细按程序完整路径分组。
+///
+/// 使用 HashMap 让每个程序只遍历一次明细列表；同名但路径不同的程序不会合并。
+/// 最后按合计降序排列，与统计页首次打开时的顺序一致。
+fn aggregate_stats(rows: &[FileOrigin]) -> Vec<ProgramStat> {
+    let mut by_program = std::collections::HashMap::<String, ProgramStat>::new();
+
+    for row in rows {
+        let stat = by_program
+            .entry(row.process_path.clone())
+            .or_insert_with(|| ProgramStat {
+                process_name: row.process_name.clone(),
+                process_path: row.process_path.clone(),
+                note: row.note.clone(),
+                create_file: 0,
+                create_dir: 0,
+                modify: 0,
+                delete_file: 0,
+                delete_dir: 0,
+            });
+
+        match row.action.as_str() {
+            "create_file" => stat.create_file += 1,
+            "create_dir" => stat.create_dir += 1,
+            "modify" => stat.modify += 1,
+            "delete_file" => stat.delete_file += 1,
+            "delete_dir" => stat.delete_dir += 1,
+            _ => {}
+        }
+    }
+
+    let mut stats: Vec<ProgramStat> = by_program.into_values().collect();
+    stats.sort_by(|a, b| {
+        b.total()
+            .cmp(&a.total())
+            .then_with(|| a.process_path.cmp(&b.process_path))
+    });
+    stats
+}
+
+/// 汇总表的程序列与统计页一致：程序名后附带备注，过长备注使用省略号。
+fn program_stat_text(stat: &ProgramStat) -> String {
+    const MAX_NOTE_CHARS: usize = 24;
+
+    let note = stat.note.trim();
+    if note.is_empty() {
+        return stat.process_name.clone();
+    }
+    if note.chars().count() > MAX_NOTE_CHARS {
+        let short: String = note.chars().take(MAX_NOTE_CHARS).collect();
+        format!("{}（{}…）", stat.process_name, short)
+    } else {
+        format!("{}（{}）", stat.process_name, note)
+    }
 }
 
 /// 给某一行填充子列文本。
@@ -2138,6 +2300,62 @@ mod tests {
         assert!(
             bytes.windows(15).any(|window| window == b"xl/workbook.xml"),
             "压缩包里应包含 xl/workbook.xml"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 汇总必须按程序路径分组、逐类计数，并默认把合计最高的程序排在前面。
+    #[test]
+    fn stats_export_aggregates_counts_and_total_order() {
+        let mut first = test_row(r"C:\work\a.txt", "chrome.exe", 100);
+        first.process_path = r"C:\Apps\chrome.exe".to_string();
+        let mut second = first.clone();
+        second.file_path = r"C:\work\b.txt".to_string();
+        second.action = "create_file".to_string();
+        let mut third = first.clone();
+        third.file_path = r"C:\work\c.txt".to_string();
+        third.action = "modify".to_string();
+
+        let mut other = test_row(r"C:\work\d", "notepad.exe", 101);
+        other.process_path = r"C:\Apps\notepad.exe".to_string();
+        other.action = "delete_dir".to_string();
+
+        let stats = super::aggregate_stats(&[first, second, third, other]);
+        assert_eq!(stats.len(), 2, "不同程序路径应分别汇总");
+        assert_eq!(stats[0].process_name, "chrome.exe");
+        assert_eq!(stats[0].create_file, 2);
+        assert_eq!(stats[0].modify, 1);
+        assert_eq!(stats[0].total(), 3);
+        assert_eq!(stats[1].process_name, "notepad.exe");
+        assert_eq!(stats[1].delete_dir, 1);
+        assert_eq!(stats[1].total(), 1);
+    }
+
+    /// 统计页的工作簿必须同时包含汇总表和明细表两个 sheet。
+    #[test]
+    fn stats_export_writes_summary_and_detail_sheets() {
+        let dir = std::env::temp_dir().join("file_origin_tracker_stats_xlsx_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.xlsx");
+        let row = test_row(r"C:\probe\a.txt", "notepad.exe", 1_700_000_000);
+
+        super::write_stats_xlsx(&path, &[row]).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..2], b"PK");
+        assert!(
+            bytes
+                .windows(24)
+                .any(|window| window == b"xl/worksheets/sheet1.xml"),
+            "应包含程序统计工作表"
+        );
+        assert!(
+            bytes
+                .windows(24)
+                .any(|window| window == b"xl/worksheets/sheet2.xml"),
+            "应包含文件来源记录工作表"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
