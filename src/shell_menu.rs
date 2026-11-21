@@ -22,7 +22,7 @@
 //! - **双文件版（推荐）**：`FileOriginTracker.exe` + `file_origin_tracker_shell.dll`
 //!   放在同一目录。exe 里不含任何 DLL 数据，也不会在运行时释放 PE 文件。
 //! - **单文件版**：把 DLL 作为 RCDATA 资源写进 exe，启动时由程序解出来写到
-//!   数据目录 `shell\` 下。好处是只需携带一个文件，但“运行时把 PE 写到磁盘”
+//!   固定基准目录 `shell\` 下。好处是只需携带一个文件，但“运行时把 PE 写到磁盘”
 //!   与木马加载器相似，可能被 360 等杀软的机器学习引擎误报。
 
 use anyhow::{Context, Result};
@@ -48,7 +48,7 @@ const REG_FILES_MENU: &str = r"Software\Classes\*\shell\FileOriginTracker";
 const REG_DIRS_MENU: &str = r"Software\Classes\Directory\shell\FileOriginTracker";
 
 /// 右键菜单扩展 DLL 的文件名。
-const SHELL_DLL_NAME: &str = "file_origin_tracker_shell.dll";
+pub(crate) const SHELL_DLL_NAME: &str = "file_origin_tracker_shell.dll";
 
 /// 打包进 exe 资源节的右键菜单 DLL 资源 ID。
 ///
@@ -96,17 +96,19 @@ fn embedded_shell_dll() -> Option<Vec<u8>> {
     }
 }
 
-/// 单文件版：把内嵌在 exe 里的右键菜单扩展 DLL 写到数据目录，返回它的路径。
+/// 单文件版：把内嵌在 exe 里的右键菜单扩展 DLL 写到固定基准目录，返回它的路径。
 ///
 /// 双文件版（exe 里没有资源）返回 None。
 ///
-/// 之所以写在数据目录而不是 exe 同目录，是为了让单文件版放在任何位置
-/// （桌面、U 盘）都能用：注册表记录的是数据目录里的固定路径。
+/// 之所以写在固定基准目录（路径指引文件所在目录）而不是 exe 同目录，
+/// 是为了让单文件版放在任何位置（桌面、U 盘）都能用；又因为该目录不会
+/// 随“配置/数据库存储路径”切换而改变，切换位置后不会在原数据目录里
+/// 留下无人使用的 DLL 副本。
 pub fn unpack_shell_dll() -> Option<PathBuf> {
     let bytes = embedded_shell_dll()?;
 
-    let data_dir = crate::config::Config::default_data_dir().ok()?;
-    let directory = data_dir.join("shell");
+    let base_dir = crate::config::Config::base_dir().ok()?;
+    let directory = base_dir.join("shell");
     let target = directory.join(SHELL_DLL_NAME);
 
     // 内容完全一致就不重复写：资源管理器可能正加载着这个 DLL，

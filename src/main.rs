@@ -30,16 +30,20 @@ use file_origin_tracker_shell::{config, db, etw, shell_menu, storage, tray};
 /// 日志按体积滚动：超过 `MAX_LOG_BYTES` 就把旧文件改名为 `.log.old` 并重新开始，
 /// 只保留一份备份。这样无论运行多久，日志占用都不会超过约 2MB。
 struct FileLogger {
-    /// 日志文件路径，滚动时需要用它重命名。
-    path: std::path::PathBuf,
-    /// 当前日志文件句柄与已写入字节数，用 Mutex 保护以支持多线程写入。
+    /// 当前日志文件路径、文件句柄与已写入字节数，用 Mutex 保护以支持多线程写入。
+    /// 路径放在锁里面，切换存储位置时可以和文件句柄一起替换。
     state: Mutex<LogState>,
 }
 
 struct LogState {
+    /// 当前日志文件路径，滚动时需要用它重命名。
+    path: std::path::PathBuf,
     file: Option<File>,
     bytes: u64,
 }
+
+/// 日志文件名。
+const LOG_FILE_NAME: &str = "file_origin_tracker.log";
 
 /// 单个日志文件的最大体积：2MB。
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
@@ -48,13 +52,58 @@ impl FileLogger {
     /// 创建日志器并打开（或创建）日志文件。
     fn new(data_dir: &std::path::Path) -> Self {
         let _ = std::fs::create_dir_all(data_dir);
-        let path = data_dir.join("file_origin_tracker.log");
-        let state = open_log(&path);
+        let path = data_dir.join(LOG_FILE_NAME);
         Self {
-            path,
-            state: Mutex::new(state),
+            state: Mutex::new(open_log(&path)),
         }
     }
+
+    /// 把日志改写到新的数据目录。
+    ///
+    /// `merge_old` 为 true（“迁移数据”模式）时，先把原日志内容追加到新日志，
+    /// 然后删除原日志和滚动备份，避免切换后原位置还残留日志文件。
+    /// 为 false（“重新记录”模式）时原位置数据整体保留，旧日志也一并保留。
+    fn relocate(&self, data_dir: &std::path::Path, merge_old: bool) {
+        let new_path = data_dir.join(LOG_FILE_NAME);
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        if guard.path == new_path {
+            return;
+        }
+
+        let old_path = guard.path.clone();
+        // 先关闭旧文件句柄，后面才能删除或移动它。
+        guard.file = None;
+
+        if merge_old {
+            let _ = std::fs::create_dir_all(data_dir);
+            append_old_log(&old_path, &new_path);
+            let _ = std::fs::remove_file(&old_path);
+            let _ = std::fs::remove_file(old_path.with_extension("log.old"));
+        }
+
+        *guard = open_log(&new_path);
+    }
+}
+
+/// 把旧日志内容追加到新日志（迁移数据时保留切换前的日志）。
+fn append_old_log(old_path: &std::path::Path, new_path: &std::path::Path) {
+    let Ok(metadata) = std::fs::metadata(old_path) else {
+        return;
+    };
+    // 过大的旧日志直接放弃合并，避免切换后一次性写入巨量内容。
+    if metadata.len() == 0 || metadata.len() > MAX_LOG_BYTES {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(old_path) else {
+        return;
+    };
+    let Ok(mut file) = File::options().create(true).append(true).open(new_path) else {
+        return;
+    };
+    let _ = file.write_all(&bytes);
+    let _ = file.flush();
 }
 
 /// 以追加模式打开日志文件，并记录它当前的大小（用于判断何时滚动）。
@@ -71,7 +120,11 @@ fn open_log(path: &std::path::Path) -> LogState {
     }
 
     let file = File::options().create(true).append(true).open(path).ok();
-    LogState { file, bytes }
+    LogState {
+        path: path.to_path_buf(),
+        file,
+        bytes,
+    }
 }
 
 impl Log for FileLogger {
@@ -97,18 +150,20 @@ impl Log for FileLogger {
 
         // 超过上限就滚动：旧的改名为 .old（覆盖上一次的 .old），再重新打开。
         if guard.bytes + line.len() as u64 > MAX_LOG_BYTES {
+            // 先取出路径再释放句柄，避免在借用 guard 的同时重新赋值。
+            let path = guard.path.clone();
             guard.file = None;
-            let backup = self.path.with_extension("log.old");
+            let backup = path.with_extension("log.old");
             let _ = std::fs::remove_file(&backup);
-            let rotated = std::fs::rename(&self.path, &backup).is_ok();
+            let rotated = std::fs::rename(&path, &backup).is_ok();
             if rotated {
-                *guard = open_log(&self.path);
+                *guard = open_log(&path);
             } else {
                 // 改名失败（文件被占用或无权限）时退化为原地清空，保证不无限增长。
-                if let Ok(file) = File::options().write(true).open(&self.path) {
+                if let Ok(file) = File::options().write(true).open(&path) {
                     let _ = file.set_len(0);
                 }
-                *guard = open_log(&self.path);
+                *guard = open_log(&path);
             }
         }
 
@@ -305,11 +360,13 @@ fn main() -> Result<()> {
             return Err(error);
         }
     };
-    let logger = FileLogger::new(&data_dir);
+    // 设为全局日志器后仍需保留引用：切换存储路径时要把日志改写到新目录。
+    // 日志器与进程同生命周期，直接泄漏成 'static 最简单可靠。
+    let logger: &'static FileLogger = Box::leak(Box::new(FileLogger::new(&data_dir)));
     // 设置全局日志器，忽略"已经设置过"的错误（多次启动时可能发生）。
-    log::set_boxed_logger(Box::new(logger))
-        .map(|()| log::set_max_level(LevelFilter::Info))
-        .ok();
+    if log::set_logger(logger).is_ok() {
+        log::set_max_level(LevelFilter::Info);
+    }
 
     info!("=== File Origin Tracker 启动 ===");
 
@@ -358,6 +415,14 @@ fn main() -> Result<()> {
         Ok(report) => {
             if report.switched {
                 info!("存储路径切换已完成：{:?}", report.mode);
+                // 日志文件也必须跟着切换：否则新位置永远没有日志，原位置还会
+                // 留下一份写了一半的旧日志。迁移模式会把旧日志并入新日志后删除，
+                // 重新记录模式保留原位置数据，旧日志也原样保留。
+                if let Ok(new_dir) = storage::active_data_dir() {
+                    let merge_old = report.mode == Some(storage::SwitchMode::Migrate);
+                    logger.relocate(&new_dir, merge_old);
+                }
+                info!("日志已切换到新的存储位置");
             }
             if !report.warnings.is_empty() {
                 let message = report.warnings.join("\n");

@@ -922,7 +922,7 @@ unsafe fn create_storage_controls(
     add(
         WINDOW_EX_STYLE::default(),
         "STATIC",
-        "最近一次重新记录前的位置（可复制）：",
+        "最近一次切换前的位置（可复制）：",
         label_style,
         562,
         378,

@@ -62,12 +62,18 @@ pub struct StorageState {
     pub active: StorageLocation,
     #[serde(default)]
     pub pending: Option<PendingSwitch>,
-    /// 只记录最近一次“重新开始”的原位置。
+    /// 只记录最近一次切换前的原位置。
     #[serde(default)]
     pub previous: Option<StorageLocation>,
     /// 已激活新位置、但暂未删除成功的旧文件，下次正常启动继续清理。
     #[serde(default)]
     cleanup_files: Vec<PathBuf>,
+    /// 迁移后需要顺手清理的附属文件（旧版本释放的右键菜单 DLL）。
+    ///
+    /// 这类文件可能正被资源管理器占用，删除失败不弹窗打扰用户，
+    /// 只在日志里留一条记录，下次启动再试。
+    #[serde(default)]
+    quiet_cleanup_files: Vec<PathBuf>,
 }
 
 /// 启动时执行存储任务的结果。
@@ -201,7 +207,7 @@ fn apply_pending_switch_at(base: &Path) -> Result<SwitchReport> {
     let mut report = SwitchReport::default();
 
     if let Some(pending) = state.pending.clone() {
-        let prepared = match prepare_switch(&state.active, &pending) {
+        let prepared = match prepare_switch(base, &state.active, &pending) {
             Ok(prepared) => prepared,
             Err(error) => {
                 // 激活前失败：旧位置从未改变，取消任务，避免每次启动都卡住。
@@ -218,10 +224,13 @@ fn apply_pending_switch_at(base: &Path) -> Result<SwitchReport> {
         let old_location = state.active.clone();
         state.active = prepared.target.clone();
         state.pending = None;
-        if pending.mode == SwitchMode::Fresh {
-            state.previous = Some(old_location);
-        }
+        // 不论“迁移数据”还是“重新记录”，都记录切换前的位置，
+        // 方便用户随时确认数据原来放在哪里。
+        state.previous = Some(old_location);
         state.cleanup_files.extend(prepared.cleanup_files);
+        state
+            .quiet_cleanup_files
+            .extend(prepared.quiet_cleanup_files);
 
         // 这是唯一的“激活点”。只有新配置和新数据库都准备好后才执行。
         if let Err(error) = save_state_to(base, &state) {
@@ -236,6 +245,9 @@ fn apply_pending_switch_at(base: &Path) -> Result<SwitchReport> {
     let (remaining, mut warnings) = delete_cleanup_files(&state.cleanup_files);
     state.cleanup_files = remaining;
     report.warnings.append(&mut warnings);
+
+    // 附属文件（旧版右键菜单 DLL）删除失败不弹窗，静默留到下次启动重试。
+    state.quiet_cleanup_files = delete_quiet_files(&state.quiet_cleanup_files);
 
     // 没有指引且没有任务时保持首次运行状态，不为只读查询主动创建文件。
     if location_file_exists || report.switched {
@@ -255,9 +267,15 @@ struct PreparedSwitch {
     created_files: Vec<PathBuf>,
     /// 激活成功后允许删除的原文件。
     cleanup_files: Vec<PathBuf>,
+    /// 激活成功后尽力清理的原位置附属文件（失败不打扰用户）。
+    quiet_cleanup_files: Vec<PathBuf>,
 }
 
-fn prepare_switch(active: &StorageLocation, pending: &PendingSwitch) -> Result<PreparedSwitch> {
+fn prepare_switch(
+    base: &Path,
+    active: &StorageLocation,
+    pending: &PendingSwitch,
+) -> Result<PreparedSwitch> {
     let target = validate_switch(active, &pending.target, pending.mode)?;
     fs::create_dir_all(&target.config_dir)
         .with_context(|| format!("无法创建配置目录：{}", target.config_dir.display()))?;
@@ -265,7 +283,7 @@ fn prepare_switch(active: &StorageLocation, pending: &PendingSwitch) -> Result<P
         .with_context(|| format!("无法创建数据库目录：{}", target.data_dir.display()))?;
 
     let mut created_files = Vec::new();
-    let result = (|| -> Result<Vec<PathBuf>> {
+    let result = (|| -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         let source_config = active.config_file();
         let target_config = target.config_file();
         let config_changed = !paths_equal(&source_config, &target_config);
@@ -295,6 +313,7 @@ fn prepare_switch(active: &StorageLocation, pending: &PendingSwitch) -> Result<P
         }
 
         let mut cleanup_files = Vec::new();
+        let mut quiet_cleanup_files = Vec::new();
         if pending.mode == SwitchMode::Migrate {
             if config_changed {
                 cleanup_files.push(source_config);
@@ -304,15 +323,23 @@ fn prepare_switch(active: &StorageLocation, pending: &PendingSwitch) -> Result<P
                 cleanup_files.push(sidecar_path(&source_database, "-wal"));
                 cleanup_files.push(sidecar_path(&source_database, "-shm"));
             }
+            // 旧版本会把单文件版的右键菜单 DLL 释放到数据目录。现在 DLL 固定
+            // 放在路径指引所在目录，迁移后旧副本不再被使用，顺手删掉以免残留。
+            // 删除失败（例如资源管理器仍加载着 DLL）只记日志，下次启动再试。
+            let shell_home = paths_equal(base, &active.data_dir);
+            if database_changed && !shell_home {
+                quiet_cleanup_files.extend(shell_dll_artifacts(&active.data_dir));
+            }
         }
-        Ok(cleanup_files)
+        Ok((cleanup_files, quiet_cleanup_files))
     })();
 
     match result {
-        Ok(cleanup_files) => Ok(PreparedSwitch {
+        Ok((cleanup_files, quiet_cleanup_files)) => Ok(PreparedSwitch {
             target,
             created_files,
             cleanup_files,
+            quiet_cleanup_files,
         }),
         Err(error) => {
             remove_created_files(&created_files);
@@ -418,6 +445,17 @@ fn sidecar_path(database: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{}", database.display(), suffix))
 }
 
+/// 旧版本遗留在数据目录里的右键菜单 DLL 及其临时文件。
+fn shell_dll_artifacts(data_dir: &Path) -> Vec<PathBuf> {
+    let directory = data_dir.join("shell");
+    let dll = directory.join(crate::shell_menu::SHELL_DLL_NAME);
+    let temp = directory.join(format!("{}.new", crate::shell_menu::SHELL_DLL_NAME));
+    [dll, temp]
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
 fn database_with_sidecars(database: &Path) -> [PathBuf; 3] {
     [
         database.to_path_buf(),
@@ -452,6 +490,7 @@ fn load_state_from(base: &Path) -> Result<(StorageState, bool)> {
             pending: None,
             previous: None,
             cleanup_files: Vec::new(),
+            quiet_cleanup_files: Vec::new(),
         },
         false,
     ))
@@ -569,6 +608,36 @@ fn delete_cleanup_files(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
     (remaining, warnings)
 }
 
+/// 静默删除附属文件：失败时不弹窗打扰用户，只写日志并留到下次启动重试。
+fn delete_quiet_files(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut remaining = Vec::new();
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                log::info!("附属文件暂未删除：{}（{}）", path.display(), error);
+                remaining.push(path.clone());
+            }
+        }
+    }
+    // DLL 删掉后顺手移除空的 shell 目录，避免原位置留下空文件夹。
+    // 目录里还有别的文件时 remove_dir 会失败，不影响任何数据。
+    for path in paths {
+        let is_shell_dir = path
+            .parent()
+            .and_then(|directory| directory.file_name())
+            .map(|name| name.eq_ignore_ascii_case("shell"))
+            .unwrap_or(false);
+        if is_shell_dir {
+            if let Some(directory) = path.parent() {
+                let _ = fs::remove_dir(directory);
+            }
+        }
+    }
+    remaining
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +691,7 @@ mod tests {
                 pending: None,
                 previous: None,
                 cleanup_files: Vec::new(),
+                quiet_cleanup_files: Vec::new(),
             },
         )
         .unwrap();
@@ -651,6 +721,13 @@ mod tests {
         let target = location(test.join("new-config"), test.join("new-data"));
         let config = initialize_state(&base, &active, 30);
         let unrelated = active.data_dir.join("keep-me.txt");
+        // 模拟旧版本遗留在数据目录里的右键菜单 DLL。
+        let stale_dll = active
+            .data_dir
+            .join("shell")
+            .join(crate::shell_menu::SHELL_DLL_NAME);
+        fs::create_dir_all(stale_dll.parent().unwrap()).unwrap();
+        fs::write(&stale_dll, "stale dll").unwrap();
 
         // 保持原连接打开，确保提交记录仍可能位于 WAL，而不是只复制主 db 文件。
         let source_database = Database::init(&active.data_dir).unwrap();
@@ -662,6 +739,10 @@ mod tests {
         schedule_switch_at(&base, target.clone(), SwitchMode::Migrate, &config).unwrap();
         let report = apply_pending_switch_at(&base).unwrap();
         assert!(report.switched);
+
+        // “迁移数据”也要记录切换前的位置，设置页才能显示原位置。
+        let switched_state = load_state_from(&base).unwrap().0;
+        assert_eq!(switched_state.previous, Some(active.clone()));
 
         let migrated = Database::open_readonly(&target.data_dir).unwrap();
         let records = migrated.recent_filtered(50, None).unwrap();
@@ -679,6 +760,11 @@ mod tests {
             assert!(!path.exists(), "原文件应已清理：{}", path.display());
         }
         assert!(unrelated.exists(), "目录中的用户文件不能被删除");
+        assert!(!stale_dll.exists(), "旧版右键菜单 DLL 应已清理");
+        assert!(
+            !stale_dll.parent().unwrap().exists(),
+            "空的 shell 目录应一并移除"
+        );
 
         let state = load_state_from(&base).unwrap().0;
         assert_eq!(state.active, target);

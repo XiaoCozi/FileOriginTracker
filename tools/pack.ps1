@@ -122,5 +122,5 @@ Write-Host ("  {0}（{1:N2} MB）" -f $dllCopy, ((Get-Item $dllCopy).Length / 1M
 Write-Host ("  {0}（{1:N2} MB）" -f $zip, ((Get-Item $zip).Length / 1MB))
 Write-Host ("  {0}（{1:N2} MB）" -f $singleExe, ((Get-Item $singleExe).Length / 1MB))
 Write-Host ''
-Write-Host '注意：单文件版会在运行时把 DLL 释放到数据目录，可能被 360 等杀毒软件误报。'
+Write-Host '注意：单文件版会在运行时把 DLL 释放到固定的数据基准目录，可能被 360 等杀毒软件误报。'
 Write-Host '      如果被拦截，请改用双文件版（exe 与 dll 放在同一目录，推荐）。'
